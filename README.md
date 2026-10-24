@@ -22,7 +22,7 @@ It sits in your taskbar and shows how much of your Codex usage window remains wi
 - Simplified Chinese display with explicit remaining usage and reset countdowns
 - Optional Claude Code usage alongside Codex
 - Optional Antigravity model usage bars for Google's 5-hour and weekly Gemini quota windows
-- Optional Kimi Code 5-hour and weekly membership quota bars
+- Optional Kimi Code 5-hour and monthly total membership quota bars
 - A live countdown until each limit resets
 - Optional low-quota alerts at 10%, 20%, or 30% remaining, deduplicated per reset window
 - Independent display controls for the 5-hour and weekly rows
@@ -116,7 +116,7 @@ Use the right-click **Monitored services** menu to choose which independent serv
 - **Antigravity** can be enabled alongside the other providers or shown by itself as its own service column
 - **Kimi Code** can be enabled alongside the other providers or shown by itself when its CLI credentials or a Kimi Code API key are available
 
-When multiple services are shown, each service has its own usage bar and matching usage text color. Antigravity prefers Google's Gemini quota summary when available and falls back to model quota data when needed. Kimi Code supports both its current ratio-based usage response and its older count-based response. New Kimi memberships without a weekly limit show `--` in the weekly row.
+When multiple services are shown, each service has its own usage bar and matching usage text color. Antigravity prefers Google's Gemini quota summary when available and falls back to model quota data when needed. Kimi Code displays only its **5-hour** and **monthly total** quotas (`limit_5h` and `limit_month_total`), matching the console's monthly usage. Weekly, code-only monthly, and recharge pools are not substituted for the monthly total. Legacy counters can still supply the 5-hour quota. Missing monthly data shows `--`, not an invented quota. The long-period row is labelled `Month` for Kimi alone, or `7d/M` alongside weekly providers; hover over Kimi for its exact monthly percentage.
 
 Claude Desktop and Claude Code CLI use separate local sessions. Signing in to Claude Desktop does not enable Claude Code monitoring. When no supported Claude Code CLI credentials are available, the menu shows **Claude Code (CLI login required)** as a disabled item and automatically keeps that service off.
 
@@ -224,7 +224,7 @@ What the app sends over the network:
 - Requests to Anthropic's Claude endpoints to read your usage and rate-limit information
 - Requests to ChatGPT's Codex usage endpoint to read your Codex usage and rate-limit information, if Codex is enabled
 - Requests to Google's Cloud Code / Antigravity endpoints to read your Antigravity quota information, if Antigravity is enabled
-- Requests to the configured Kimi Code `/usages` endpoint to read your 5-hour and weekly quotas, if Kimi Code is enabled; `KIMI_CODE_BASE_URL` can select a compatible HTTPS endpoint
+- Requests to the configured Kimi Code `/usages` endpoint to read your 5-hour and monthly total quotas, if Kimi Code is enabled; `KIMI_CODE_BASE_URL` can select a compatible HTTPS endpoint
 - Requests to GitHub only if you use the app's update check / self-update feature
 - If proxy environment variables such as `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` are set, those outbound requests may use that proxy
 

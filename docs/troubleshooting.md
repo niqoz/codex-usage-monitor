@@ -16,6 +16,8 @@ Authentication failures pause provider polling until the credential source chang
 
 ## Kimi Code sign-in
 
+Kimi Code's second row is **monthly total usage**, not a weekly quota. It reads `usages.limit_month_total`, matching the console (for example, `used_ratio: 0.0572` means 5.72% used). `limit_month_code`, `limit_7d`, and legacy weekly counters are deliberately not used as monthly substitutes. If the API omits monthly total, `--` means this API did not report that period; it does not mean the subscription has no monthly quota.
+
 Kimi Code monitors membership quotas, not a Kimi Open Platform pay-as-you-go balance. The easiest setup is **Configure Kimi Code API key…** in the right-click menu. Choose the region that issued the key and save. Kimi Code is enabled and refreshed immediately. The key is stored in Windows Credential Manager under `CodexUsage:kimi-code`, not in `settings.json`, logs, or CLI credential files.
 
 The saved key is authoritative: invalid saved keys do not silently fall back to a different account. Reopen the dialog to replace it, or use **Remove key** to return to environment/CLI authentication. You can also run `kimi` in a terminal and use `/login`, then reopen **Monitored services** and enable **Kimi Code**.

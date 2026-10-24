@@ -11,6 +11,7 @@ pub struct UsageSection {
 #[derive(Clone, Debug, Default)]
 pub struct UsageData {
     pub session: UsageSection,
+    /// Long-period row: weekly for other providers, monthly total for Kimi Code.
     pub weekly: UsageSection,
 }
 

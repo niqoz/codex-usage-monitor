@@ -22,7 +22,7 @@
 - 支持简体中文界面，明确显示剩余用量和重置倒计时
 - 可同时显示 Claude Code 用量
 - 可显示 Google 5 小时及每周 Gemini 配额窗口中的 Antigravity 模型用量
-- 可显示 Kimi Code 会员的 5 小时及每周配额
+- 可显示 Kimi Code 会员的 5 小时及每月总配额
 - 实时显示各项限额的重置倒计时
 - 可在剩余配额为 10%、20% 或 30% 时发出提醒；每个重置窗口只提醒一次
 - 可分别控制 5 小时和每周用量行的显示
@@ -116,7 +116,7 @@ codex-usage
 - **Antigravity** 可与其他提供商同时显示，也可作为独立服务列单独显示
 - **Kimi Code** 在具有 CLI 凭据或 Kimi Code API Key 时，可与其他提供商同时显示或单独显示
 
-显示多个服务时，每个服务都有自己的用量条和对应的文字颜色。Antigravity 会优先使用 Google 的 Gemini 配额摘要，必要时回退到模型配额数据。Kimi Code 同时支持当前的比率响应和旧版计数响应。没有每周限额的新 Kimi 会员会在每周行显示 `--`。
+显示多个服务时，每个服务都有自己的用量条和对应的文字颜色。Antigravity 会优先使用 Google 的 Gemini 配额摘要，必要时回退到模型配额数据。Kimi Code 仅显示 **5 小时**和**每月总量**（`limit_5h`、`limit_month_total`），与控制台的每月使用量一致。每周、每月代码专用和充值包不会替代每月总量；旧版计数仍可提供 5 小时额度。未提供每月额度时显示 `--`。Kimi 单独显示时第二行标为“月”，与其他服务同时显示时标为“7天/月”；悬停可查看精确的每月百分比。
 
 Claude 桌面客户端与 Claude Code CLI 使用相互独立的本地登录状态。只登录 Claude 桌面客户端不会启用 Claude Code 监控。检测不到受支持的 Claude Code CLI 凭据时，菜单会以禁用状态显示 **Claude Code（需登录 CLI）**，并自动关闭该服务。
 
@@ -229,7 +229,7 @@ Kimi Code 监控读取的是会员配额窗口，而不是 Kimi 开放平台的�
 - 请求 Anthropic 的 Claude 端点，以读取用量和速率限制信息
 - 启用 Codex 时，请求 ChatGPT 的 Codex 用量端点，以读取 Codex 用量和速率限制信息
 - 启用 Antigravity 时，请求 Google Cloud Code / Antigravity 端点，以读取 Antigravity 配额信息
-- 启用 Kimi Code 时，请求配置的 Kimi Code `/usages` 端点，以读取 5 小时和每周配额；`KIMI_CODE_BASE_URL` 可选择兼容的 HTTPS 端点
+- 启用 Kimi Code 时，请求配置的 Kimi Code `/usages` 端点，以读取 5 小时和每月总配额；`KIMI_CODE_BASE_URL` 可选择兼容的 HTTPS 端点
 - 仅在使用软件更新检查或自更新功能时请求 GitHub
 - 如果设置了 `HTTPS_PROXY`、`HTTP_PROXY` 或 `ALL_PROXY` 等代理环境变量，上述出站请求可能通过代理发送
 

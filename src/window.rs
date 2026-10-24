@@ -682,7 +682,12 @@ fn service_tooltip(
         parts.push(format!("5h {session_text}"));
     }
     if show_weekly_window {
-        parts.push(format!("7d {weekly_text}"));
+        let period = if service == "Kimi Code" {
+            "month"
+        } else {
+            "7d"
+        };
+        parts.push(format!("{period} {weekly_text}"));
     }
     format!("{service}: {}", parts.join(" | "))
 }
@@ -872,8 +877,16 @@ fn append_provider_alerts(
         kind,
         provider_key,
         provider_label,
-        "weekly",
-        strings.weekly_window,
+        if provider_key == "kimi_code" {
+            "monthly"
+        } else {
+            "weekly"
+        },
+        if provider_key == "kimi_code" {
+            monthly_label(language)
+        } else {
+            strings.weekly_window
+        },
         &usage.weekly,
     );
 }
@@ -1818,7 +1831,12 @@ fn row_bar_segment_count(active_models: i32) -> i32 {
 /// Labels and reset texts that can occupy the widest space in each column.
 fn usage_layout_samples(language: LanguageId) -> (Vec<&'static str>, Vec<String>) {
     let strings = language.strings();
-    let labels = vec![strings.session_window, strings.weekly_window];
+    let labels = vec![
+        strings.session_window,
+        strings.weekly_window,
+        monthly_label(language),
+        long_period_label(language, true, true),
+    ];
     let resets = if language == LanguageId::SimplifiedChinese {
         vec!["23:59重置 *".to_string(), "12/31重置 *".to_string()]
     } else {
@@ -1834,6 +1852,28 @@ fn usage_layout_samples(language: LanguageId) -> (Vec<&'static str>, Vec<String>
         .collect()
     };
     (labels, resets)
+}
+
+fn monthly_label(language: LanguageId) -> &'static str {
+    match language {
+        LanguageId::French => "Mois",
+        LanguageId::SimplifiedChinese => "月",
+        _ => "Month",
+    }
+}
+
+fn long_period_label(language: LanguageId, kimi: bool, others: bool) -> &'static str {
+    if !kimi {
+        return language.strings().weekly_window;
+    }
+    if !others {
+        return monthly_label(language);
+    }
+    match language {
+        LanguageId::French => "7j/M",
+        LanguageId::SimplifiedChinese => "7天/月",
+        _ => "7d/M",
+    }
 }
 
 unsafe fn create_widget_font(appearance: Appearance) -> HFONT {
@@ -2383,7 +2423,17 @@ fn update_quota_tooltips() {
                         "\nThis provider did not return quota in the latest update."
                     });
                 }
-                if matches!(id, 1 | 3) && s.monitor.services[id].data.is_some() {
+                if id == 3 {
+                    if let Some(usage) = s.monitor.services[id].data.as_ref() {
+                        for (monthly, section) in [(false, &usage.session), (true, &usage.weekly)] {
+                            text.push('\n');
+                            text.push_str(&quota_tooltip::kimi_message(
+                                s.language, monthly, section,
+                            ));
+                        }
+                    }
+                }
+                if id == 1 && s.monitor.services[id].data.is_some() {
                     for (missing, is_weekly) in [(session == "--", false), (weekly == "--", true)] {
                         if missing {
                             text.push('\n');
@@ -2818,7 +2868,11 @@ fn paint_content(
                 is_dark,
                 appearance,
                 text_color,
-                strings.weekly_window,
+                long_period_label(
+                    language,
+                    show_kimi_code,
+                    show_claude_code || show_codex || show_antigravity,
+                ),
                 weekly_pct,
                 weekly_text,
                 codex_weekly_pct,
@@ -4351,9 +4405,11 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(session_label.as_ptr()),
         );
         let weekly_label = native_interop::wide_str(if language == LanguageId::SimplifiedChinese {
-            "每周额度"
+            "长期额度（Kimi 每月，其他每周）"
+        } else if language == LanguageId::French {
+            "Quota long (Kimi mensuel, autres hebdomadaire)"
         } else {
-            "Weekly quota"
+            "Long-term quota (Kimi monthly, others weekly)"
         });
         let weekly_flags = if show_weekly_window {
             MF_CHECKED
@@ -5345,6 +5401,24 @@ mod tests {
     }
 
     #[test]
+    fn kimi_period_labels_do_not_relabel_other_providers_as_monthly() {
+        assert_eq!(long_period_label(LanguageId::French, true, false), "Mois");
+        assert_eq!(long_period_label(LanguageId::French, true, true), "7j/M");
+        assert_eq!(
+            long_period_label(LanguageId::French, false, true),
+            LanguageId::French.strings().weekly_window
+        );
+        assert_eq!(
+            service_tooltip("Kimi Code", "100%", "6%", true, true),
+            "Kimi Code: 5h 100% | month 6%"
+        );
+        assert_eq!(
+            service_tooltip("Codex", "20%", "30%", true, true),
+            "Codex: 5h 20% | 7d 30%"
+        );
+    }
+
+    #[test]
     fn tray_summary_keeps_all_four_providers_within_the_windows_limit() {
         for language in LanguageId::ALL {
             let strings = language.strings();
@@ -5369,7 +5443,7 @@ mod tests {
             let tooltip = tray_services_tooltip(&services, true, true);
             assert!(tooltip.encode_utf16().count() <= 127, "{tooltip}");
             assert_eq!(tooltip.lines().count(), 4);
-            assert!(tooltip.contains("Kimi Code: 5h 100%* | 7d 100%*"));
+            assert!(tooltip.contains("Kimi Code: 5h 100%* | month 100%*"));
         }
     }
 

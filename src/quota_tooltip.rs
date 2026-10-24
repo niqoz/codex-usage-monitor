@@ -25,6 +25,34 @@ static STATE: Mutex<State> = Mutex::new(State {
 // the standard tooltip control accepts these TOOLINFO structures.
 const TOOL_INFO_SIZE: u32 = std::mem::offset_of!(TTTOOLINFOW, lpReserved) as u32;
 
+pub fn kimi_message(
+    language: crate::localization::LanguageId,
+    monthly: bool,
+    section: &crate::models::UsageSection,
+) -> String {
+    use crate::localization::LanguageId;
+    let period = match (language, monthly) {
+        (LanguageId::French, false) => "5 heures",
+        (LanguageId::French, true) => "Mensuel (total)",
+        (LanguageId::SimplifiedChinese, false) => "5 小时",
+        (LanguageId::SimplifiedChinese, true) => "每月（总量）",
+        (_, false) => "5 hours",
+        (_, true) => "Monthly (total)",
+    };
+    if !section.reported {
+        return match language {
+            LanguageId::French => format!("{period} : non fourni par l’API (--)."),
+            LanguageId::SimplifiedChinese => format!("{period}：接口未提供（--）。"),
+            _ => format!("{period}: not reported by the API (--)."),
+        };
+    }
+    match language {
+        LanguageId::French => format!("{period} : {:.2} % consommés.", section.percentage),
+        LanguageId::SimplifiedChinese => format!("{period}：已用 {:.2}%。", section.percentage),
+        _ => format!("{period}: {:.2}% used.", section.percentage),
+    }
+}
+
 pub fn message(chinese: bool, weekly: bool) -> &'static str {
     match (chinese, weekly) {
         (true, false) => "账号未提供 5 小时限额；-- 表示无该窗口的数据，并非剩余 100%。",
@@ -139,6 +167,25 @@ pub fn clear() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kimi_tooltip_describes_monthly_total_not_weekly() {
+        use crate::localization::LanguageId;
+        let section = crate::models::UsageSection {
+            percentage: 5.72,
+            reported: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            kimi_message(LanguageId::French, true, &section),
+            "Mensuel (total) : 5.72 % consommés."
+        );
+        assert!(
+            kimi_message(LanguageId::English, true, &section).contains("Monthly (total): 5.72%")
+        );
+        assert!(kimi_message(LanguageId::French, true, &Default::default())
+            .contains("non fourni par l’API"));
+    }
 
     #[test]
     fn native_tooltips_follow_available_regions() {

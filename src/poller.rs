@@ -178,7 +178,7 @@ struct KimiCodeUsageResponse {
 #[derive(Deserialize)]
 struct KimiCodeUsagePools {
     limit_5h: Option<KimiCodeRatioPool>,
-    limit_7d: Option<KimiCodeRatioPool>,
+    limit_month_total: Option<KimiCodeRatioPool>,
 }
 
 #[derive(Deserialize)]
@@ -1188,21 +1188,25 @@ fn kimi_code_usage_from_response(response: KimiCodeUsageResponse) -> Option<Usag
         usages,
         limits,
     } = response;
-    let (ratio_session, ratio_weekly) = match usages {
+    let (ratio_session, monthly) = match usages {
         Some(usages) => (
             usages.limit_5h.as_ref().and_then(kimi_code_ratio_section),
-            usages.limit_7d.as_ref().and_then(kimi_code_ratio_section),
+            usages
+                .limit_month_total
+                .as_ref()
+                .and_then(kimi_code_ratio_section),
         ),
         None => (None, None),
     };
-    let count_weekly = usage.as_ref().and_then(kimi_code_count_section);
+    // Legacy `usage` is weekly and must never be relabelled as monthly.
+    let _ = usage;
     let count_session = limits.unwrap_or_default().iter().find_map(|limit| {
         kimi_code_is_session_window(&limit.window)
             .then(|| kimi_code_count_section(&limit.detail))
             .flatten()
     });
     let session = kimi_code_merge_section(ratio_session, count_session);
-    let weekly = kimi_code_merge_section(ratio_weekly, count_weekly);
+    let weekly = monthly;
     if session.is_none() && weekly.is_none() {
         return None;
     }
@@ -2564,12 +2568,12 @@ mod tests {
     }
 
     #[test]
-    fn kimi_ratio_pools_parse_session_weekly_and_missing_windows() {
+    fn kimi_ratio_pools_parse_session_monthly_and_missing_windows() {
         let usage = kimi_usage(
             r#"{
                 "usages": {
                     "limit_5h": {"used_ratio": 0.625, "reset_time": "2026-09-19T14:45:59.449979235Z"},
-                    "limit_7d": {"used_ratio": "0.125", "reset_time": "2026-09-20T00:00:00Z"}
+                    "limit_month_total": {"used_ratio": "0.125", "reset_time": "2026-10-20T00:00:00Z"}
                 }
             }"#,
         )
@@ -2582,7 +2586,7 @@ mod tests {
         let session_only = kimi_usage(
             r#"{"usages":{"limit_5h":{"used_ratio":0.4,"reset_time":"2026-09-19T14:45:59Z"}}}"#,
         )
-        .expect("new plans can omit the weekly window");
+        .expect("plans can omit the monthly window");
         assert_eq!(session_only.session.percentage, 40.0);
         assert_eq!(session_only.weekly.percentage, 0.0);
         assert!(session_only.weekly.resets_at.is_none());
@@ -2618,7 +2622,7 @@ mod tests {
     }
 
     #[test]
-    fn kimi_legacy_counts_support_both_windows_and_remaining_fallback() {
+    fn kimi_legacy_counts_supply_session_but_not_monthly() {
         let usage = kimi_usage(
             r#"{
                 "usage": {"limit": "100", "used": "19", "resetTime": "2026-09-19T16:45:59Z"},
@@ -2630,9 +2634,12 @@ mod tests {
         )
         .expect("legacy counters should be usable");
         assert_eq!(usage.session.percentage, 25.0);
-        assert_eq!(usage.weekly.percentage, 19.0);
+        assert!(
+            !usage.weekly.reported,
+            "legacy weekly counters are not monthly"
+        );
         assert!(usage.session.resets_at.is_some());
-        assert!(usage.weekly.resets_at.is_some());
+        assert!(usage.weekly.resets_at.is_none());
     }
 
     #[test]
@@ -2652,7 +2659,10 @@ mod tests {
         )
         .expect("mixed response should be usable");
         assert_eq!(usage.session.percentage, 1.0);
-        assert_eq!(usage.weekly.percentage, 19.0);
+        assert!(
+            !usage.weekly.reported,
+            "a weekly ratio is not a monthly quota"
+        );
     }
 
     #[test]
@@ -2660,11 +2670,45 @@ mod tests {
         for json in [
             "{}",
             r#"{"usages":{}}"#,
-            r#"{"usages":{"limit_month_total":{"used_ratio":0.5}}}"#,
+            r#"{"usages":{"limit_month_code":{"used_ratio":0.5}}}"#,
+            r#"{"usages":{"limit_7d":{"used_ratio":0.5}}}"#,
             r#"{"usages":{"limit_5h":{"used_ratio":-0.5}}}"#,
         ] {
             assert!(kimi_usage(json).is_none(), "unexpected quota for {json}");
         }
+    }
+
+    #[test]
+    fn kimi_monthly_total_matches_console_and_ignores_weekly_and_code_pools() {
+        let usage = kimi_usage(
+            r#"{"usages":{
+            "limit_5h":{"used_ratio":1,"reset_time":"2026-10-24T22:33:03Z"},
+            "limit_month_total":{"used_ratio":0.0572,"reset_time":"2026-11-25T00:00:00Z"},
+            "limit_month_code":{"used_ratio":0.0545},
+            "limit_7d":{"used_ratio":0.9}
+        }}"#,
+        )
+        .unwrap();
+        assert_eq!(usage.session.percentage, 100.0);
+        assert!((usage.weekly.percentage - 5.72).abs() < 0.000001);
+        assert!(usage.weekly.reported);
+        assert_eq!(
+            usage.weekly.resets_at,
+            parse_iso8601(Some("2026-11-25T00:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn kimi_monthly_only_and_reported_zero_are_not_missing() {
+        for ratio in ["0", "0.0572"] {
+            let usage = kimi_usage(&format!(
+                r#"{{"usages":{{"limit_month_total":{{"used_ratio":{ratio}}}}}}}"#
+            ))
+            .unwrap();
+            assert!(usage.weekly.reported);
+            assert!(!usage.session.reported);
+        }
+        assert!(kimi_usage(r#"{"usages":{"limit_month_total":{"used_ratio":-1}}}"#).is_none());
     }
 
     #[test]
