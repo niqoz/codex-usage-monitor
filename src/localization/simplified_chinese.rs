@@ -14,6 +14,7 @@ pub(super) const STRINGS: Strings = Strings {
     claude_code_model: "Claude Code",
     codex_model: "Codex",
     antigravity_model: "Antigravity",
+    kimi_code_model: "Kimi Code",
     settings: "设置",
     start_with_windows: "开机自动启动",
     reset_position: "重置位置",
@@ -46,6 +47,10 @@ pub(super) const STRINGS: Strings = Strings {
     codex_token_expired_body: "请在终端中运行 'codex' 并按提示重新登录。完成后请刷新或重启本工具。",
     antigravity_token_expired_title: "Antigravity 登录已失效",
     antigravity_token_expired_body: "请打开 Antigravity 并重新登录。完成后请刷新或重启本工具。",
+    kimi_code_token_expired_title: "Kimi Code 登录已失效",
+    kimi_code_token_expired_body:
+        "请通过“设置 Kimi Code API Key”检查密钥，或运行 'kimi' 并使用 '/login' 登录，然后刷新本工具。",
     codex_window_title: "Codex 用量监控",
     antigravity_window_title: "Antigravity 用量监控",
+    kimi_code_window_title: "Kimi Code 用量监控",
 };

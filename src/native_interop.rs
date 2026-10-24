@@ -177,9 +177,13 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
     unsafe {
         // Preserve existing extended style, add tool window + no activate
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         // Reset alpha mode used by the startup popup fallback before switching
-        // back to UpdateLayeredWindow rendering inside the taskbar.
-        if ex_style & WS_EX_LAYERED.0 as i32 != 0 {
+        // back to UpdateLayeredWindow rendering inside the taskbar. Never reset
+        // it on an already embedded child: without a Windows 8+ manifest,
+        // Windows rejects re-adding WS_EX_LAYERED to a child window. The first
+        // monitor switch would then leave an invisible, non-layered widget.
+        if style & WS_CHILD_STYLE == 0 && ex_style & WS_EX_LAYERED.0 as i32 != 0 {
             let _ = SetWindowLongW(hwnd, GWL_EXSTYLE, ex_style & !(WS_EX_LAYERED.0 as i32));
         }
         let _ = SetWindowLongW(
@@ -189,7 +193,6 @@ pub fn embed_in_taskbar(hwnd: HWND, taskbar_hwnd: HWND) {
         );
 
         // Change from popup to child
-        let style = GetWindowLongW(hwnd, GWL_STYLE) as u32;
         let new_style = (style & !WS_POPUP_STYLE) | WS_CHILD_STYLE | WS_CLIPSIBLINGS_STYLE;
         let _ = SetWindowLongW(hwnd, GWL_STYLE, new_style as i32);
 
@@ -203,6 +206,48 @@ mod attachment_tests {
     use windows::core::w;
     use windows::Win32::Foundation::{COLORREF, POINT, SIZE};
     use windows::Win32::Graphics::Gdi::*;
+
+    unsafe fn render_fixture(child: HWND) -> windows::core::Result<()> {
+        let dc = CreateCompatibleDC(None);
+        let info = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: 40,
+                biWidth: 2,
+                biHeight: -2,
+                biPlanes: 1,
+                biBitCount: 32,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+        std::slice::from_raw_parts_mut(bits as *mut u32, 4).fill(0xffffffff);
+        let old = SelectObject(dc, bitmap);
+        let point = POINT { x: 0, y: 0 };
+        let size = SIZE { cx: 2, cy: 2 };
+        let blend = BLENDFUNCTION {
+            BlendOp: AC_SRC_OVER as u8,
+            SourceConstantAlpha: 255,
+            AlphaFormat: AC_SRC_ALPHA as u8,
+            ..Default::default()
+        };
+        let rendered = UpdateLayeredWindow(
+            child,
+            None,
+            Some(&point),
+            Some(&size),
+            dc,
+            Some(&point),
+            COLORREF(0),
+            Some(&blend),
+            ULW_ALPHA,
+        );
+        let _ = SelectObject(dc, old);
+        let _ = DeleteObject(bitmap);
+        let _ = DeleteDC(dc);
+        rendered
+    }
 
     #[test]
     fn startup_popup_can_switch_to_layered_child_rendering() {
@@ -240,50 +285,83 @@ mod attachment_tests {
             SetLayeredWindowAttributes(child, COLORREF(0), 255, LWA_ALPHA).unwrap();
             embed_in_taskbar(child, parent);
             assert_eq!(GetParent(child).unwrap(), parent);
-            let dc = CreateCompatibleDC(None);
-            let info = BITMAPINFO {
-                bmiHeader: BITMAPINFOHEADER {
-                    biSize: 40,
-                    biWidth: 2,
-                    biHeight: -2,
-                    biPlanes: 1,
-                    biBitCount: 32,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-            let mut bits = std::ptr::null_mut();
-            let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
-            std::slice::from_raw_parts_mut(bits as *mut u32, 4).fill(0xffffffff);
-            let old = SelectObject(dc, bitmap);
-            let point = POINT { x: 0, y: 0 };
-            let size = SIZE { cx: 2, cy: 2 };
-            let blend = BLENDFUNCTION {
-                BlendOp: AC_SRC_OVER as u8,
-                SourceConstantAlpha: 255,
-                AlphaFormat: AC_SRC_ALPHA as u8,
-                ..Default::default()
-            };
-            let rendered = UpdateLayeredWindow(
-                child,
-                None,
-                Some(&point),
-                Some(&size),
-                dc,
-                Some(&point),
-                COLORREF(0),
-                Some(&blend),
-                ULW_ALPHA,
-            );
-            let _ = SelectObject(dc, old);
-            let _ = DeleteObject(bitmap);
-            let _ = DeleteDC(dc);
+            let rendered = render_fixture(child);
             let _ = DestroyWindow(child);
             let _ = DestroyWindow(parent);
             assert!(
                 rendered.is_ok(),
                 "fallback alpha mode must not prevent taskbar rendering: {rendered:?}"
             );
+        }
+    }
+
+    #[test]
+    fn moving_an_embedded_widget_preserves_its_layered_style() {
+        unsafe {
+            // Hidden parents avoid flashing test windows on the user's desktop.
+            let mut parents = Vec::new();
+            for _ in 0..2 {
+                parents.push(
+                    CreateWindowExW(
+                        WINDOW_EX_STYLE(0),
+                        w!("STATIC"),
+                        w!("taskbar-switch-test"),
+                        WS_POPUP,
+                        0,
+                        0,
+                        20,
+                        20,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                );
+            }
+            let child = CreateWindowExW(
+                WS_EX_LAYERED,
+                w!("STATIC"),
+                w!("widget-switch-test"),
+                WS_POPUP,
+                0,
+                0,
+                2,
+                2,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            embed_in_taskbar(child, parents[0]);
+            let _ = ShowWindow(child, SW_SHOWNOACTIVATE);
+            let mut styles = Vec::new();
+            let mut actual_parents = Vec::new();
+            let mut rendered = Vec::new();
+            for index in [1, 0, 1, 1, 0] {
+                embed_in_taskbar(child, parents[index]);
+                styles.push(GetWindowLongW(child, GWL_EXSTYLE));
+                actual_parents.push(GetParent(child).unwrap());
+                rendered.push(render_fixture(child));
+            }
+            let _ = DestroyWindow(child);
+            for parent in &parents {
+                let _ = DestroyWindow(*parent);
+            }
+            for (iteration, (style, parent)) in styles.into_iter().zip(actual_parents).enumerate() {
+                assert_ne!(
+                    style & WS_EX_LAYERED.0 as i32,
+                    0,
+                    "monitor switch {iteration} must not remove WS_EX_LAYERED"
+                );
+                assert_eq!(parent, parents[[1, 0, 1, 1, 0][iteration]]);
+                assert!(
+                    rendered[iteration].is_ok(),
+                    "monitor switch {iteration} must still render: {:?}",
+                    rendered[iteration]
+                );
+            }
         }
     }
 }

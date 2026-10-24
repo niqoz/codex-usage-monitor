@@ -11,7 +11,7 @@
 
 This animation shows the original segmented-bar design. Current builds let you choose segmented or continuous bars in **Appearance**.
 
-A lightweight native Windows taskbar widget for monitoring Codex usage, with optional Claude Code and Google Antigravity usage display.
+A lightweight native Windows taskbar widget for monitoring Codex usage, with optional Claude Code, Google Antigravity and Kimi Code usage display.
 
 It sits in your taskbar and shows how much of your Codex usage window remains without opening the Codex app or account usage page.
 
@@ -22,6 +22,7 @@ It sits in your taskbar and shows how much of your Codex usage window remains wi
 - Simplified Chinese display with explicit remaining usage and reset countdowns
 - Optional Claude Code usage alongside Codex
 - Optional Antigravity model usage bars for Google's 5-hour and weekly Gemini quota windows
+- Optional Kimi Code 5-hour and weekly membership quota bars
 - A live countdown until each limit resets
 - Optional low-quota alerts at 10%, 20%, or 30% remaining, deduplicated per reset window
 - Independent display controls for the 5-hour and weekly rows
@@ -31,7 +32,7 @@ It sits in your taskbar and shows how much of your Codex usage window remains wi
 - Right-click options for refresh, monitored services, usage rows, quota alerts, update frequency, language, startup, widget visibility, and updates
 - Multi-monitor taskbar placement, so the widget can live on the taskbar for the screen you prefer
 - Appearance options for palette, bar style, bar thickness, and text size
-- Claude and OpenAI marks for each service column, with Codex shown in green
+- Claude, OpenAI and Kimi marks for service columns, with Codex shown in green and Kimi Code in blue
 - Quota windows that a service does not report show `--` and an empty bar instead of a false 100%
 - Each service refreshes and retries on its own; a failed refresh keeps the last numbers and marks them `*`
 - Hover over a service column to see its last successful update, next refresh, and any error
@@ -45,6 +46,8 @@ Codex is enabled by default. The app reads the same local credentials used by Co
 
 Antigravity support is optional too. To show Antigravity usage, install and sign in to Google Antigravity, then enable the **Antigravity** service from the right-click **Monitored services** menu.
 
+Kimi Code support is also optional. Install Kimi Code CLI and sign in with `/login`, or configure a Kimi Code API key, then enable **Kimi Code** from **Monitored services**. Kimi Code is disabled by default.
+
 It works best if you want a simple "how close am I to the limit?" display that is always visible.
 
 ## Requirements
@@ -53,6 +56,7 @@ It works best if you want a simple "how close am I to the limit?" display that i
 - Codex CLI or Codex app installed and authenticated
 - Optional: Claude Code installed and authenticated
 - Optional: Google Antigravity installed and authenticated, if you want Antigravity usage
+- Optional: Kimi Code CLI installed and authenticated, or a Kimi Code API key
 
 Refresh after network recovery needs Windows 10 version 2004 or later. On earlier Windows 10 builds the app still runs, but it only refreshes after wake from sleep and on its normal schedule.
 
@@ -110,10 +114,21 @@ Use the right-click **Monitored services** menu to choose which independent serv
 - **Codex** is enabled by default
 - **Claude Code** can be enabled alongside Codex or shown by itself when Claude Code CLI is installed and authenticated
 - **Antigravity** can be enabled alongside the other providers or shown by itself as its own service column
+- **Kimi Code** can be enabled alongside the other providers or shown by itself when its CLI credentials or a Kimi Code API key are available
 
-When multiple services are shown, each service has its own usage bar and matching usage text color. Antigravity prefers Google's Gemini quota summary when available and falls back to model quota data when needed.
+When multiple services are shown, each service has its own usage bar and matching usage text color. Antigravity prefers Google's Gemini quota summary when available and falls back to model quota data when needed. Kimi Code supports both its current ratio-based usage response and its older count-based response. New Kimi memberships without a weekly limit show `--` in the weekly row.
 
 Claude Desktop and Claude Code CLI use separate local sessions. Signing in to Claude Desktop does not enable Claude Code monitoring. When no supported Claude Code CLI credentials are available, the menu shows **Claude Code (CLI login required)** as a disabled item and automatically keeps that service off.
+
+### Kimi Code API Key
+
+Right-click the widget or tray icon and choose **Configure Kimi Code API key…**. Paste a key from the Kimi Code console, choose **China (kimi.com)** or **International (kimi.ai)** to match its issuer, then click **Save**. Saving automatically enables Kimi Code and refreshes its quotas without restarting or refreshing other providers.
+
+The input is masked. The key and selected region are stored in the current user's **Windows Credential Manager** under `CodexUsage:kimi-code`, never in `settings.json`, diagnostic logs, or the CLI configuration. The saved key takes precedence over environment variables and CLI credentials, and is only sent to the selected region's official Code API. Existing keys are not displayed or prefilled: leave the input empty to keep the current key, or paste a replacement. Changing regions requires entering a matching key. **Cancel** leaves credentials and settings unchanged.
+
+**Remove key** deletes only the credential saved by this app; environment variables and CLI credentials remain available as fallbacks. Normal uninstall preserves settings and this saved credential; remove the key in the dialog first if you do not want to keep it.
+
+Alternatively, use `KIMI_CODE_API_KEY`, or sign in with `kimi` and `/login`, then enable **Kimi Code** in **Monitored services**. The configuration action remains available even when Kimi Code has no credentials.
 
 ### System Tray Icon
 
@@ -187,6 +202,8 @@ As of **March 19, 2026**, Anthropic's Claude Code setup documentation says:
 
 If Anthropic changes Claude Code availability in the future, this app should follow whatever Claude Code supports, as long as the usage data remains exposed through the same authenticated endpoints.
 
+Kimi Code monitoring reads membership quota windows, not the pay-as-you-go balance of Kimi Open Platform. It supports the official `managed:kimi-code` provider configuration in mainland China (`kimi.com`) and international (`kimi.ai`) regions. Kimi Code API keys and Kimi Open Platform API keys are separate and are not interchangeable.
+
 ## Privacy And Security
 
 This project is **open source**, so you can inspect exactly what it does.
@@ -198,12 +215,16 @@ What the app reads:
 - If needed, the same credentials file inside an installed WSL distro
 - If Codex is enabled, your local Codex credentials from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`
 - If Antigravity is enabled, your local Antigravity OAuth token from Windows Credential Manager target `gemini:antigravity`
+- For Kimi Code availability detection and monitoring, the `managed:kimi-code` API key, base URL and OAuth reference from `$KIMI_CODE_HOME/config.toml` or `~/.kimi-code/config.toml`
+- The selected Kimi Code OAuth access token from `credentials/<name>.json` in that directory (`kimi-code.json` for the default region), or an explicit `KIMI_CODE_API_KEY` environment value
+- A Kimi Code API key explicitly saved through this app, from Windows Credential Manager target `CodexUsage:kimi-code`; this source takes precedence and does not use endpoint overrides
 
 What the app sends over the network:
 
 - Requests to Anthropic's Claude endpoints to read your usage and rate-limit information
 - Requests to ChatGPT's Codex usage endpoint to read your Codex usage and rate-limit information, if Codex is enabled
 - Requests to Google's Cloud Code / Antigravity endpoints to read your Antigravity quota information, if Antigravity is enabled
+- Requests to the configured Kimi Code `/usages` endpoint to read your 5-hour and weekly quotas, if Kimi Code is enabled; `KIMI_CODE_BASE_URL` can select a compatible HTTPS endpoint
 - Requests to GitHub only if you use the app's update check / self-update feature
 - If proxy environment variables such as `HTTPS_PROXY`, `HTTP_PROXY`, or `ALL_PROXY` are set, those outbound requests may use that proxy
 
@@ -219,6 +240,7 @@ What the app stores locally:
 - Quota-window notification keys used to prevent duplicate alerts
 - Displayed model preferences
 - Appearance, selected display, left-edge pinning, and the faster-refresh setting
+- If you enter a Kimi Code key in the app, that key and its region in Windows Credential Manager (not in the settings file)
 
 What it does **not** do:
 
@@ -227,6 +249,7 @@ What it does **not** do:
 - It does not collect analytics or telemetry
 - It does not upload your project files
 - It does not directly edit your Codex credentials file
+- It does not edit Kimi Code configuration or credential files, and it does not refresh Kimi OAuth tokens
 - It does not read or reuse Claude Desktop authentication data
 
 Notes:
@@ -234,6 +257,8 @@ Notes:
 - If your Claude Code token is expired, the app may ask the local Claude CLI to refresh it in the background
 - If your Codex token is expired, the app may ask the local Codex CLI to refresh it in the background. The monitor does not write `auth.json` itself; any credential update is handled by the Codex CLI.
 - If your Antigravity token is expired, open Antigravity and sign in again. The monitor does not write Windows Credential Manager entries itself.
+- If your Kimi Code token is expired, run `kimi` and use `/login` so the official CLI can renew it. The monitor deliberately leaves CLI-owned OAuth credentials read-only.
+- Kimi Code endpoint overrides require an explicit `KIMI_CODE_API_KEY` or matching environment-scoped CLI credentials. A default CLI token or a key from an unrelated configuration is never forwarded to the override, and usage requests do not follow redirects.
 - Portable installs can update themselves by downloading the latest release from this repository
 - Proxies should be trusted because proxied usage requests include your OAuth bearer token inside the TLS connection
 
@@ -242,7 +267,7 @@ Notes:
 The monitor:
 
 1. Finds your enabled model login credentials
-2. Reads your current usage from Anthropic, ChatGPT, and/or Google's Antigravity endpoints
+2. Reads your current usage from Anthropic, ChatGPT, Google's Antigravity, and/or Kimi Code endpoints
 3. Shows the result directly in the Windows taskbar
 4. Keeps the widget aligned with the selected taskbar and tray area
 5. Refreshes periodically in the background
@@ -253,7 +278,7 @@ If the newer usage endpoint is unavailable, it can fall back to reading the rate
 
 This project is licensed under the MIT License. The original [LICENSE](LICENSE) and copyright notice are preserved.
 
-The Claude and OpenAI marks come from [Lobe Icons](https://github.com/lobehub/lobe-icons) under the MIT License. See [src/icons/providers](src/icons/providers). Brand names and marks belong to their owners.
+The Claude, OpenAI and Kimi marks come from [Lobe Icons](https://github.com/lobehub/lobe-icons) under the MIT License. See [src/icons/providers](src/icons/providers). Brand names and marks belong to their owners.
 
 Codex Usage is a maintained derivative of [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor). Thanks to Craig Constable and the upstream contributors for the original project. Changes in this repository are not affiliated with or endorsed by the upstream maintainers or OpenAI.
 

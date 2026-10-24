@@ -14,6 +14,7 @@ pub(super) const STRINGS: Strings = Strings {
     claude_code_model: "Claude Code",
     codex_model: "Codex",
     antigravity_model: "Antigravity",
+    kimi_code_model: "Kimi Code",
     settings: "Configurações",
     start_with_windows: "Iniciar com o Windows",
     reset_position: "Redefinir Posição",
@@ -45,6 +46,9 @@ pub(super) const STRINGS: Strings = Strings {
     codex_token_expired_body: "Execute 'codex' em um terminal e siga as instruções de login. Depois disso, atualize ou reinicie este aplicativo.",
     antigravity_token_expired_title: "Erro de Autenticação do Antigravity",
     antigravity_token_expired_body: "Abra o Antigravity e entre novamente. Depois disso, atualize ou reinicie este aplicativo.",
+    kimi_code_token_expired_title: "Erro de Autenticação do Kimi Code",
+    kimi_code_token_expired_body: "Execute 'kimi' em um terminal e use '/login'. Depois disso, atualize ou reinicie este aplicativo.",
     codex_window_title: "Monitor de uso do Codex",
     antigravity_window_title: "Monitor de uso do Antigravity",
+    kimi_code_window_title: "Monitor de uso do Kimi Code",
 };

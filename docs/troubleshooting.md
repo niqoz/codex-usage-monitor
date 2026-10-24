@@ -14,6 +14,18 @@ Codex Usage keeps authentication failures separate from transient service failur
 
 Authentication failures pause provider polling until the credential source changes, preventing repeated login notifications. Transient failures use exponential backoff up to the configured refresh interval.
 
+## Kimi Code sign-in
+
+Kimi Code monitors membership quotas, not a Kimi Open Platform pay-as-you-go balance. The easiest setup is **Configure Kimi Code API key…** in the right-click menu. Choose the region that issued the key and save. Kimi Code is enabled and refreshed immediately. The key is stored in Windows Credential Manager under `CodexUsage:kimi-code`, not in `settings.json`, logs, or CLI credential files.
+
+The saved key is authoritative: invalid saved keys do not silently fall back to a different account. Reopen the dialog to replace it, or use **Remove key** to return to environment/CLI authentication. You can also run `kimi` in a terminal and use `/login`, then reopen **Monitored services** and enable **Kimi Code**.
+
+The monitor reads `$KIMI_CODE_HOME/config.toml` or `~/.kimi-code/config.toml` and the OAuth credential selected by that configuration. The default credential is `~/.kimi-code/credentials/kimi-code.json`; international and custom environments use their scoped credential filename. A Kimi Code API key from the managed provider configuration or `KIMI_CODE_API_KEY` is also accepted.
+
+OAuth tokens are used read-only. If a token expires, let the official CLI renew it, then choose **Refresh** or wait for the credential file change to be detected. Codex Usage never rewrites the Kimi configuration, access token, or refresh token.
+
+For CLI authentication, an unknown token expiry, invalid TOML configuration, unsupported credential storage, or mismatched OAuth reference requires signing in again or correcting the configuration. The monitor will not fall back to another saved account. To use a different `KIMI_CODE_BASE_URL`, remove any in-app key and supply an explicit `KIMI_CODE_API_KEY` or CLI credentials scoped to that endpoint; keys from unrelated configuration are not forwarded.
+
 ## Diagnostic log
 
 Run:
@@ -38,6 +50,10 @@ Direct installations and portable copies download only the exact `codex-usage.ex
 ## Reset local position without deleting settings
 
 Right-click the taskbar component and choose **Settings > Reset Position**. Settings are stored at `%APPDATA%\CodexUsage\settings.json`.
+
+## Widget disappears after switching displays
+
+Switching **Settings > Display** must preserve the widget's layered rendering mode. Older builds could remove this mode while moving an already embedded widget between taskbars, leaving the app running but its content invisible. Restarting restores the display temporarily; install the fixed build to keep it visible across repeated monitor changes. Do not delete settings or saved API keys. Rendering failures are recorded in the diagnostic log when `--diagnose` is enabled.
 
 ## Reinstall while preserving settings
 

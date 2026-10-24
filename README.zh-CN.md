@@ -11,7 +11,7 @@
 
 这张动图展示的是早期分段进度条。当前版本可在**外观**中选择分段或连续进度条。
 
-一款轻量级的 Windows 原生任务栏小组件，用于监控 Codex 用量，并可选择同时显示 Claude Code 和 Google Antigravity 用量。
+一款轻量级的 Windows 原生任务栏小组件，用于监控 Codex 用量，并可选择同时显示 Claude Code、Google Antigravity 和 Kimi Code 用量。
 
 它常驻任务栏，无需打开 Codex 应用或账户用量页面，就能随时查看 Codex 用量窗口还剩多少。
 
@@ -22,6 +22,7 @@
 - 支持简体中文界面，明确显示剩余用量和重置倒计时
 - 可同时显示 Claude Code 用量
 - 可显示 Google 5 小时及每周 Gemini 配额窗口中的 Antigravity 模型用量
+- 可显示 Kimi Code 会员的 5 小时及每周配额
 - 实时显示各项限额的重置倒计时
 - 可在剩余配额为 10%、20% 或 30% 时发出提醒；每个重置窗口只提醒一次
 - 可分别控制 5 小时和每周用量行的显示
@@ -31,7 +32,7 @@
 - 右键菜单支持刷新、监控服务、用量行、配额提醒、更新频率、语言、开机启动、组件显示和软件更新等设置
 - 支持多显示器任务栏，可将组件放到指定屏幕的任务栏中
 - 可调整配色、进度条样式、进度条粗细和文字大小
-- 每个服务列显示 Claude 或 OpenAI 标志，Codex 使用绿色
+- 服务列显示 Claude、OpenAI 或 Kimi 标志，Codex 使用绿色，Kimi Code 使用蓝色
 - 服务没有返回的额度窗口显示 `--` 和空进度条，不再误显示剩余 100%
 - 各服务独立刷新和重试；刷新失败时保留上次的数字并标记 `*`
 - 鼠标悬停在服务列上，可查看上次成功更新时间、下次刷新时间和错误原因
@@ -45,6 +46,8 @@ Codex 默认启用，应用会读取 Codex 使用的同一份本地登录凭据�
 
 Antigravity 也是可选功能。若要显示其用量，请安装并登录 Google Antigravity，然后在右键菜单的**监控服务**中启用 **Antigravity**。
 
+Kimi Code 同样是可选功能，且默认关闭。安装 Kimi Code CLI 并通过 `/login` 登录，或配置 Kimi Code API Key，然后在**监控服务**中启用 **Kimi Code**。
+
 如果你希望始终看到自己离用量上限还有多远，而不必反复打开其他页面，这款工具会很合适。
 
 ## 系统要求
@@ -53,6 +56,7 @@ Antigravity 也是可选功能。若要显示其用量，请安装并登录 Goog
 - 已安装并完成身份验证的 Codex CLI 或 Codex 应用
 - 可选：已安装并完成身份验证的 Claude Code
 - 可选：若需查看 Antigravity 用量，需安装并登录 Google Antigravity
+- 可选：已安装并完成身份验证的 Kimi Code CLI，或 Kimi Code API Key
 
 网络恢复后自动刷新需要 Windows 10 2004 或更高版本。在更早的 Windows 10 上，应用照常运行，但只在睡眠唤醒后和按正常周期刷新。
 
@@ -110,10 +114,19 @@ codex-usage
 - **Codex** 默认启用
 - **Claude Code** 在已安装并登录 Claude Code CLI 时，可与 Codex 同时显示或单独显示
 - **Antigravity** 可与其他提供商同时显示，也可作为独立服务列单独显示
+- **Kimi Code** 在具有 CLI 凭据或 Kimi Code API Key 时，可与其他提供商同时显示或单独显示
 
-显示多个服务时，每个服务都有自己的用量条和对应的文字颜色。Antigravity 会优先使用 Google 的 Gemini 配额摘要，必要时回退到模型配额数据。
+显示多个服务时，每个服务都有自己的用量条和对应的文字颜色。Antigravity 会优先使用 Google 的 Gemini 配额摘要，必要时回退到模型配额数据。Kimi Code 同时支持当前的比率响应和旧版计数响应。没有每周限额的新 Kimi 会员会在每周行显示 `--`。
 
 Claude 桌面客户端与 Claude Code CLI 使用相互独立的本地登录状态。只登录 Claude 桌面客户端不会启用 Claude Code 监控。检测不到受支持的 Claude Code CLI 凭据时，菜单会以禁用状态显示 **Claude Code（需登录 CLI）**，并自动关闭该服务。
+
+### Kimi Code API Key
+
+右键单击组件或托盘图标，选择**设置 Kimi Code API Key…**，粘贴 Kimi Code 控制台的密钥，选择对应的中国（`kimi.com`）或国际（`kimi.ai`）区域并保存。保存后会自动启用 Kimi Code 并刷新其额度，无需重启，也不会强制刷新其他服务。
+
+密钥输入被隐藏，密钥及区域保存在当前用户的 Windows 凭据管理器中，目标为 `CodexUsage:kimi-code`，不会写入 `settings.json`、日志或 CLI 配置。应用内保存的密钥优先于环境变量和 CLI 凭据，且只发送到所选区域的官方 Code API。已保存的密钥不会回填显示：输入框留空可保留原密钥，也可粘贴新密钥替换。切换区域需要重新输入对应密钥，取消不会更改设置。
+
+**删除密钥**只删除本应用保存的凭据，不影响环境变量或 CLI 登录。正常卸载会保留设置及该凭据；如不想保留，请先在此窗口删除密钥。也可继续使用 `KIMI_CODE_API_KEY`，或通过 `kimi` 和 `/login` 登录后在监控服务中启用 Kimi Code。没有凭据时仍可打开密钥设置窗口。
 
 ### 系统托盘图标
 
@@ -194,6 +207,8 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 
 如果 Anthropic 以后调整 Claude Code 的可用范围，只要用量数据仍通过相同的身份验证端点提供，本应用会跟随 Claude Code 的支持范围。
 
+Kimi Code 监控读取的是会员配额窗口，而不是 Kimi 开放平台的按量付费余额。应用支持中国大陆（`kimi.com`）和国际（`kimi.ai`）区域的官方 `managed:kimi-code` 提供商配置。Kimi Code API Key 与 Kimi 开放平台 API Key 相互独立，不能混用。
+
 ## 隐私与安全
 
 本项目是**开源软件**，你可以直接检查它的具体行为。
@@ -205,12 +220,16 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 - 必要时，已安装 WSL 发行版中的同一凭据文件
 - 启用 Codex 时，读取 `$CODEX_HOME/auth.json` 或 `~/.codex/auth.json` 中的本地 Codex 凭据
 - 启用 Antigravity 时，读取 Windows 凭据管理器中目标为 `gemini:antigravity` 的本地 OAuth 令牌
+- 为检测 Kimi Code 可用性并进行监控，读取 `$KIMI_CODE_HOME/config.toml` 或 `~/.kimi-code/config.toml` 中 `managed:kimi-code` 的 API Key、基础 URL 和 OAuth 引用
+- 读取该目录下 `credentials/<name>.json` 中所选的 Kimi Code OAuth 访问令牌（默认区域为 `kimi-code.json`），或显式设置的 `KIMI_CODE_API_KEY` 环境变量
+- 读取通过本应用保存到 Windows 凭据管理器目标 `CodexUsage:kimi-code` 的 Kimi Code API Key；该来源优先于其他来源，且不会使用端点覆盖
 
 应用通过网络发送的请求：
 
 - 请求 Anthropic 的 Claude 端点，以读取用量和速率限制信息
 - 启用 Codex 时，请求 ChatGPT 的 Codex 用量端点，以读取 Codex 用量和速率限制信息
 - 启用 Antigravity 时，请求 Google Cloud Code / Antigravity 端点，以读取 Antigravity 配额信息
+- 启用 Kimi Code 时，请求配置的 Kimi Code `/usages` 端点，以读取 5 小时和每周配额；`KIMI_CODE_BASE_URL` 可选择兼容的 HTTPS 端点
 - 仅在使用软件更新检查或自更新功能时请求 GitHub
 - 如果设置了 `HTTPS_PROXY`、`HTTP_PROXY` 或 `ALL_PROXY` 等代理环境变量，上述出站请求可能通过代理发送
 
@@ -226,6 +245,7 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 - 用于避免重复提醒的配额窗口通知键
 - 显示模型偏好
 - 外观、所选显示器、左侧固定和加快刷新设置
+- 如在应用内输入 Kimi Code 密钥，会将密钥及区域保存到 Windows 凭据管理器，而非设置文件
 
 应用**不会**执行的操作：
 
@@ -234,6 +254,7 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 - 不收集分析数据或遥测信息
 - 不上传项目文件
 - 不直接修改 Codex 凭据文件
+- 不修改 Kimi Code 配置或凭据文件，也不刷新 Kimi OAuth 令牌
 - 不读取或复用 Claude 桌面客户端的认证数据
 
 注意：
@@ -241,6 +262,8 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 - 如果 Claude Code 令牌过期，应用可能会在后台调用本地 Claude CLI 进行刷新
 - 如果 Codex 令牌过期，应用可能会在后台调用本地 Codex CLI 进行刷新。监控器本身不会写入 `auth.json`，任何凭据更新都由 Codex CLI 完成
 - 如果 Antigravity 令牌过期，请打开 Antigravity 并重新登录。监控器不会写入 Windows 凭据管理器
+- 如果 Kimi Code 令牌过期，请运行 `kimi` 并使用 `/login`，让官方 CLI 完成续期。监控器会以只读方式使用 CLI 管理的 OAuth 凭据
+- 覆盖 Kimi Code 端点时，需要显式设置 `KIMI_CODE_API_KEY` 或使用与环境匹配的 CLI 凭据。默认 CLI 令牌及其他配置的 API Key 不会发送到覆盖端点，用量请求也不会跟随重定向
 - 便携版可以从本仓库下载最新版本进行自更新
 - 代理必须可信，因为代理转发的用量请求会在 TLS 连接内包含 OAuth Bearer 令牌
 
@@ -249,7 +272,7 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 监控器会：
 
 1. 查找已启用模型的登录凭据
-2. 从 Anthropic、ChatGPT 和/或 Google Antigravity 端点读取当前用量
+2. 从 Anthropic、ChatGPT、Google Antigravity 和/或 Kimi Code 端点读取当前用量
 3. 将结果直接显示在 Windows 任务栏中
 4. 保持组件与所选任务栏及托盘区域对齐
 5. 在后台定期刷新
@@ -260,7 +283,7 @@ Codex 用量来自本地 Codex 安装中已登录的账户。可选的 Claude Co
 
 本项目采用 MIT License。原始 [LICENSE](LICENSE) 及版权声明均予以保留。
 
-Claude 和 OpenAI 标志来自 [Lobe Icons](https://github.com/lobehub/lobe-icons)，采用 MIT License，详见 [src/icons/providers](src/icons/providers)。品牌名称和标志归各自所有者所有。
+Claude、OpenAI 和 Kimi 标志来自 [Lobe Icons](https://github.com/lobehub/lobe-icons)，采用 MIT License，详见 [src/icons/providers](src/icons/providers)。品牌名称和标志归各自所有者所有。
 
 Codex Usage 是 [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) 的持续维护衍生版本。感谢 Craig Constable 和上游贡献者创建原始项目。本仓库中的修改与上游维护者或 OpenAI 不存在隶属或背书关系。
 

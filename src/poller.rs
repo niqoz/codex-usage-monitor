@@ -6,10 +6,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::os::windows::process::CommandExt;
 
 use crate::diagnose;
+use crate::kimi_credentials;
 use crate::localization::Strings;
 use crate::models::{UsageData, UsageSection};
 use crate::native_interop;
@@ -17,6 +19,9 @@ use crate::native_interop;
 const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const KIMI_CODE_DEFAULT_BASE_URL: &str = "https://api.kimi.com/coding/v1";
+const KIMI_CODE_DEFAULT_OAUTH_HOST: &str = "https://auth.kimi.com";
+const KIMI_CODE_DEFAULT_CREDENTIAL: &str = "kimi-code";
 const ANTIGRAVITY_CREDENTIAL_TARGET: &str = "gemini:antigravity";
 const ANTIGRAVITY_ENDPOINTS: &[&str] = &[
     "https://daily-cloudcode-pa.googleapis.com",
@@ -64,6 +69,7 @@ pub enum CredentialWatchMode {
     AllSources,
     Antigravity,
     Codex,
+    KimiCode,
 }
 
 pub type CredentialWatchSnapshot = Vec<String>;
@@ -110,6 +116,103 @@ struct CodexRateLimitWindow {
 }
 
 const CODEX_SESSION_WINDOW_MAX_SECONDS: u64 = 24 * 60 * 60;
+
+#[derive(Default, Deserialize)]
+struct KimiCodeConfig {
+    #[serde(default)]
+    providers: HashMap<String, KimiCodeProviderConfig>,
+}
+
+#[derive(Default, Deserialize)]
+struct KimiCodeProviderConfig {
+    base_url: Option<String>,
+    api_key: Option<String>,
+    oauth: Option<KimiCodeOAuthConfig>,
+}
+
+#[derive(Default, Deserialize)]
+struct KimiCodeOAuthConfig {
+    storage: Option<String>,
+    key: Option<String>,
+    #[serde(rename = "oauthHost", alias = "oauth_host")]
+    oauth_host: Option<String>,
+}
+
+#[derive(Clone, Default)]
+struct KimiCodeEnvironment {
+    api_key: Option<String>,
+    base_url: Option<String>,
+    oauth_host: Option<String>,
+}
+
+enum KimiCodeTokenSource {
+    ApiKey(String),
+    OAuth(PathBuf),
+}
+
+struct KimiCodeAuthPlan {
+    base_url: String,
+    source: KimiCodeTokenSource,
+    config_path: PathBuf,
+}
+
+struct KimiCodeCredentials {
+    access_token: String,
+    base_url: String,
+}
+
+#[derive(Deserialize)]
+struct KimiCodeTokenFile {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    expires_at: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct KimiCodeUsageResponse {
+    usage: Option<KimiCodeUsageDetail>,
+    usages: Option<KimiCodeUsagePools>,
+    limits: Option<Vec<KimiCodeRateLimit>>,
+}
+
+#[derive(Deserialize)]
+struct KimiCodeUsagePools {
+    limit_5h: Option<KimiCodeRatioPool>,
+    limit_7d: Option<KimiCodeRatioPool>,
+}
+
+#[derive(Deserialize)]
+struct KimiCodeRatioPool {
+    used_ratio: Option<serde_json::Value>,
+    reset_time: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KimiCodeUsageDetail {
+    limit: Option<serde_json::Value>,
+    used: Option<serde_json::Value>,
+    remaining: Option<serde_json::Value>,
+    #[serde(
+        rename = "resetTime",
+        alias = "reset_time",
+        alias = "resetAt",
+        alias = "reset_at"
+    )]
+    reset_time: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct KimiCodeRateLimit {
+    window: KimiCodeWindow,
+    detail: KimiCodeUsageDetail,
+}
+
+#[derive(Deserialize)]
+struct KimiCodeWindow {
+    duration: Option<u64>,
+    #[serde(rename = "timeUnit")]
+    time_unit: Option<String>,
+}
 
 #[derive(Deserialize)]
 struct AntigravityAuthFile {
@@ -204,6 +307,7 @@ pub fn poll_provider(id: usize) -> Result<UsageData, PollError> {
         0 => poll_claude_code(),
         1 => poll_codex(),
         2 => poll_antigravity(),
+        3 => poll_kimi_code(),
         _ => Err(PollError::RequestFailed),
     }
 }
@@ -258,6 +362,36 @@ fn poll_antigravity() -> Result<UsageData, PollError> {
     };
 
     fetch_antigravity_usage(&creds.access_token)
+}
+
+/// Whether Kimi Code API-key or OAuth credentials are available locally.
+pub fn kimi_code_credentials_available() -> bool {
+    match kimi_credentials::load() {
+        Ok(Some(_)) => return true,
+        Err(_) => return false,
+        Ok(None) => {}
+    }
+    let Some(plan) = kimi_code_auth_plan() else {
+        return false;
+    };
+    match plan.source {
+        KimiCodeTokenSource::ApiKey(_) => true,
+        KimiCodeTokenSource::OAuth(path) => read_kimi_code_token_file(&path).is_some_and(|token| {
+            token
+                .access_token
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty())
+                || token
+                    .refresh_token
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+        }),
+    }
+}
+
+fn poll_kimi_code() -> Result<UsageData, PollError> {
+    let creds = read_kimi_code_credentials()?;
+    fetch_kimi_code_usage(&creds.access_token, &creds.base_url)
 }
 
 fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError> {
@@ -529,9 +663,14 @@ fn resolve_windows_codex_path() -> String {
 }
 
 fn build_agent() -> Result<ureq::Agent, PollError> {
+    build_agent_with_redirects(5)
+}
+
+fn build_agent_with_redirects(redirects: u32) -> Result<ureq::Agent, PollError> {
     let tls = native_tls::TlsConnector::new().map_err(|_| PollError::RequestFailed)?;
     Ok(ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
+        .redirects(redirects)
         .tls_connector(std::sync::Arc::new(tls))
         .build())
 }
@@ -566,13 +705,18 @@ pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSn
     if mode == CredentialWatchMode::Antigravity {
         return vec![antigravity_credential_watch_signature()];
     }
+    if mode == CredentialWatchMode::KimiCode {
+        return kimi_code_credential_watch_snapshot();
+    }
 
     let sources = match mode {
         CredentialWatchMode::ActiveSource => read_first_credentials()
             .map(|creds| vec![creds.source])
             .unwrap_or_else(all_known_credential_sources),
         CredentialWatchMode::AllSources => all_known_credential_sources(),
-        CredentialWatchMode::Antigravity | CredentialWatchMode::Codex => unreachable!(),
+        CredentialWatchMode::Antigravity
+        | CredentialWatchMode::Codex
+        | CredentialWatchMode::KimiCode => unreachable!(),
     };
 
     let mut snapshot: CredentialWatchSnapshot = sources
@@ -916,7 +1060,156 @@ fn codex_section_from_window(window: &CodexRateLimitWindow) -> UsageSection {
     UsageSection {
         percentage: window.used_percent,
         resets_at: unix_to_system_time(Some(window.reset_at)),
+        reported: true,
     }
+}
+
+fn fetch_kimi_code_usage(token: &str, base_url: &str) -> Result<UsageData, PollError> {
+    // Never forward a CLI credential through an HTTP redirect.
+    let agent = build_agent_with_redirects(0)?;
+    fetch_kimi_code_usage_with_agent(token, base_url, &agent)
+}
+
+fn fetch_kimi_code_usage_with_agent(
+    token: &str,
+    base_url: &str,
+    agent: &ureq::Agent,
+) -> Result<UsageData, PollError> {
+    let url = format!("{}/usages", base_url.trim_end_matches('/'));
+    let resp = match agent
+        .get(&url)
+        .set("Authorization", &format!("Bearer {token}"))
+        .set("Accept", "application/json")
+        .call()
+    {
+        Ok(resp) => resp,
+        Err(error) => {
+            let classified = classify_ureq_error(&error);
+            diagnose::log_error("Kimi Code usage endpoint request failed", error);
+            return Err(classified);
+        }
+    };
+
+    if !(200..300).contains(&resp.status()) {
+        return Err(classify_http_status(resp.status()));
+    }
+    let response: KimiCodeUsageResponse = match resp.into_json() {
+        Ok(response) => response,
+        Err(error) => {
+            diagnose::log_error("unable to parse Kimi Code usage response", error);
+            return Err(PollError::RequestFailed);
+        }
+    };
+    kimi_code_usage_from_response(response).ok_or(PollError::RequestFailed)
+}
+
+fn kimi_code_ratio_section(pool: &KimiCodeRatioPool) -> Option<UsageSection> {
+    let ratio = pool
+        .used_ratio
+        .as_ref()
+        .and_then(kimi_code_numeric_value)
+        .filter(|ratio| *ratio >= 0.0)?;
+    Some(UsageSection {
+        percentage: ratio.clamp(0.0, 1.0) * 100.0,
+        resets_at: parse_iso8601(pool.reset_time.as_deref()),
+        reported: true,
+    })
+}
+
+fn kimi_code_count_section(detail: &KimiCodeUsageDetail) -> Option<UsageSection> {
+    let limit = detail
+        .limit
+        .as_ref()
+        .and_then(kimi_code_numeric_value)
+        .filter(|limit| *limit > 0.0)?;
+    let used = detail
+        .used
+        .as_ref()
+        .and_then(kimi_code_numeric_value)
+        .or_else(|| {
+            detail
+                .remaining
+                .as_ref()
+                .and_then(kimi_code_numeric_value)
+                .map(|remaining| limit - remaining)
+        })
+        .filter(|used| *used >= 0.0)?;
+    Some(UsageSection {
+        percentage: (used / limit * 100.0).clamp(0.0, 100.0),
+        resets_at: parse_iso8601(detail.reset_time.as_deref()),
+        reported: true,
+    })
+}
+
+fn kimi_code_is_session_window(window: &KimiCodeWindow) -> bool {
+    let seconds_per_unit = match window.time_unit.as_deref() {
+        Some("TIME_UNIT_MINUTE") => 60,
+        Some("TIME_UNIT_HOUR") => 60 * 60,
+        Some("TIME_UNIT_DAY") => 24 * 60 * 60,
+        _ => return false,
+    };
+    window
+        .duration
+        .and_then(|duration| duration.checked_mul(seconds_per_unit))
+        == Some(5 * 60 * 60)
+}
+
+fn kimi_code_reset_times_match(left: Option<SystemTime>, right: Option<SystemTime>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => left
+            .duration_since(right)
+            .or_else(|_| right.duration_since(left))
+            .is_ok_and(|difference| difference <= Duration::from_secs(2)),
+        _ => false,
+    }
+}
+
+fn kimi_code_merge_section(
+    ratio: Option<UsageSection>,
+    count: Option<UsageSection>,
+) -> Option<UsageSection> {
+    match (ratio, count) {
+        (Some(mut ratio), Some(count)) => {
+            // Some regional responses temporarily include a zero ratio beside
+            // authoritative legacy counters. Reconcile only matching windows.
+            if kimi_code_reset_times_match(ratio.resets_at, count.resets_at) {
+                ratio.percentage = ratio.percentage.max(count.percentage);
+            }
+            Some(ratio)
+        }
+        (Some(ratio), None) => Some(ratio),
+        (None, count) => count,
+    }
+}
+
+fn kimi_code_usage_from_response(response: KimiCodeUsageResponse) -> Option<UsageData> {
+    let KimiCodeUsageResponse {
+        usage,
+        usages,
+        limits,
+    } = response;
+    let (ratio_session, ratio_weekly) = match usages {
+        Some(usages) => (
+            usages.limit_5h.as_ref().and_then(kimi_code_ratio_section),
+            usages.limit_7d.as_ref().and_then(kimi_code_ratio_section),
+        ),
+        None => (None, None),
+    };
+    let count_weekly = usage.as_ref().and_then(kimi_code_count_section);
+    let count_session = limits.unwrap_or_default().iter().find_map(|limit| {
+        kimi_code_is_session_window(&limit.window)
+            .then(|| kimi_code_count_section(&limit.detail))
+            .flatten()
+    });
+    let session = kimi_code_merge_section(ratio_session, count_session);
+    let weekly = kimi_code_merge_section(ratio_weekly, count_weekly);
+    if session.is_none() && weekly.is_none() {
+        return None;
+    }
+    Some(UsageData {
+        session: session.unwrap_or_default(),
+        weekly: weekly.unwrap_or_default(),
+    })
 }
 
 fn antigravity_credential_watch_signature() -> String {
@@ -1096,6 +1389,7 @@ fn antigravity_section_from_quota(quota: AntigravityQuotaInfo) -> Option<UsageSe
     Some(UsageSection {
         percentage: (1.0 - remaining) * 100.0,
         resets_at: parse_iso8601(quota.reset_time.as_deref()),
+        reported: true,
     })
 }
 
@@ -1106,6 +1400,7 @@ fn antigravity_section_from_summary_bucket(
     Some(UsageSection {
         percentage: (1.0 - remaining) * 100.0,
         resets_at: parse_iso8601(bucket.reset_time.as_deref()),
+        reported: true,
     })
 }
 
@@ -1299,6 +1594,261 @@ fn read_codex_credentials() -> Option<CodexTokenData> {
 
     let auth: CodexAuthFile = serde_json::from_str(&content).ok()?;
     auth.tokens.filter(|tokens| !tokens.access_token.is_empty())
+}
+
+fn cleaned_kimi_code_value(value: Option<String>) -> Option<String> {
+    value.and_then(|value| {
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+fn kimi_code_environment() -> KimiCodeEnvironment {
+    KimiCodeEnvironment {
+        api_key: cleaned_kimi_code_value(std::env::var("KIMI_CODE_API_KEY").ok()),
+        base_url: cleaned_kimi_code_value(std::env::var("KIMI_CODE_BASE_URL").ok()),
+        oauth_host: cleaned_kimi_code_value(
+            std::env::var("KIMI_CODE_OAUTH_HOST")
+                .ok()
+                .or_else(|| std::env::var("KIMI_OAUTH_HOST").ok()),
+        ),
+    }
+}
+
+fn kimi_code_home() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("KIMI_CODE_HOME") {
+        if !path.is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    Some(dirs::home_dir()?.join(".kimi-code"))
+}
+
+fn normalize_kimi_code_base_url(value: &str) -> Option<String> {
+    let value = value.trim().trim_end_matches('/');
+    let parsed = url::Url::parse(value).ok()?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || value.contains('\\')
+        || value.chars().any(char::is_whitespace)
+        || value.chars().any(char::is_control)
+    {
+        return None;
+    }
+    Some(value.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct KimiCodeOAuthEnvironment<'a> {
+    oauth_host: &'a str,
+    base_url: &'a str,
+}
+
+fn kimi_code_credential_name(oauth_host: &str, base_url: &str) -> String {
+    let oauth_host = oauth_host.trim().trim_end_matches('/');
+    let base_url = base_url.trim().trim_end_matches('/');
+    if oauth_host == KIMI_CODE_DEFAULT_OAUTH_HOST && base_url == KIMI_CODE_DEFAULT_BASE_URL {
+        return KIMI_CODE_DEFAULT_CREDENTIAL.to_string();
+    }
+    let environment = KimiCodeOAuthEnvironment {
+        oauth_host,
+        base_url,
+    };
+    let serialized = serde_json::to_string(&environment).unwrap_or_default();
+    let digest = Sha256::digest(serialized.as_bytes());
+    let suffix = digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("kimi-code-env-{suffix}")
+}
+
+fn kimi_code_storage_name(key: &str) -> Option<String> {
+    let name = key.strip_prefix("oauth/").unwrap_or(key);
+    if name.is_empty() || name.starts_with('.') || name.contains(['/', '\\']) || name == ".." {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn kimi_code_auth_plan() -> Option<KimiCodeAuthPlan> {
+    let home = kimi_code_home()?;
+    kimi_code_auth_plan_from(&home, &kimi_code_environment())
+}
+
+fn kimi_code_auth_plan_from(
+    home: &std::path::Path,
+    environment: &KimiCodeEnvironment,
+) -> Option<KimiCodeAuthPlan> {
+    let config_path = home.join("config.toml");
+    let mut config = match std::fs::read_to_string(&config_path) {
+        Ok(content) => toml::from_str::<KimiCodeConfig>(&content).ok()?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => KimiCodeConfig::default(),
+        Err(_) => return None,
+    };
+    let provider = config
+        .providers
+        .remove("managed:kimi-code")
+        .unwrap_or_default();
+    let oauth = provider.oauth.unwrap_or_default();
+    let has_environment_override =
+        environment.base_url.is_some() || environment.oauth_host.is_some();
+    let oauth_host = if has_environment_override {
+        environment.oauth_host.as_deref()
+    } else {
+        environment
+            .oauth_host
+            .as_deref()
+            .or(oauth.oauth_host.as_deref())
+    }
+    .unwrap_or(KIMI_CODE_DEFAULT_OAUTH_HOST)
+    .trim()
+    .trim_end_matches('/')
+    .to_string();
+    let default_base_url = if oauth_host == "https://auth.kimi.ai" {
+        "https://api.kimi.ai/coding/v1"
+    } else {
+        KIMI_CODE_DEFAULT_BASE_URL
+    };
+    let configured_base_url = provider.base_url.as_deref().unwrap_or(default_base_url);
+    let base_url = normalize_kimi_code_base_url(
+        environment
+            .base_url
+            .as_deref()
+            .unwrap_or(configured_base_url),
+    )?;
+    // An endpoint override must not carry an API key from an unrelated config.
+    let can_reuse_config_key = environment.base_url.as_deref().is_none_or(|value| {
+        normalize_kimi_code_base_url(value) == normalize_kimi_code_base_url(configured_base_url)
+    });
+
+    if let Some(api_key) = environment.api_key.clone().or_else(|| {
+        can_reuse_config_key
+            .then(|| cleaned_kimi_code_value(provider.api_key))
+            .flatten()
+    }) {
+        return Some(KimiCodeAuthPlan {
+            base_url,
+            source: KimiCodeTokenSource::ApiKey(api_key),
+            config_path,
+        });
+    }
+
+    let expected_name = kimi_code_credential_name(&oauth_host, &base_url);
+    if !has_environment_override {
+        if oauth
+            .storage
+            .as_deref()
+            .is_some_and(|storage| storage != "file")
+        {
+            return None;
+        }
+        if let Some(key) = oauth.key.as_deref() {
+            // Fail closed rather than silently selecting an old/default account.
+            if kimi_code_storage_name(key).as_deref() != Some(expected_name.as_str()) {
+                return None;
+            }
+        }
+    }
+    let credential_name = expected_name;
+    Some(KimiCodeAuthPlan {
+        base_url,
+        source: KimiCodeTokenSource::OAuth(
+            home.join("credentials")
+                .join(format!("{credential_name}.json")),
+        ),
+        config_path,
+    })
+}
+
+fn read_kimi_code_token_file(path: &std::path::Path) -> Option<KimiCodeTokenFile> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn kimi_code_numeric_value(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_f64(),
+        serde_json::Value::String(value) => value.trim().parse().ok(),
+        _ => None,
+    }
+    .filter(|value| value.is_finite())
+}
+
+fn read_kimi_code_credentials() -> Result<KimiCodeCredentials, PollError> {
+    // An in-app choice is authoritative, including its region. Never apply an
+    // environment endpoint override to a key stored through the native editor.
+    if let Some(key) = kimi_credentials::load().map_err(|_| PollError::NoCredentials)? {
+        return Ok(KimiCodeCredentials {
+            access_token: key.api_key,
+            base_url: key.region.base_url().to_string(),
+        });
+    }
+    let home = kimi_code_home().ok_or(PollError::NoCredentials)?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    read_kimi_code_credentials_from(&home, &kimi_code_environment(), now)
+}
+
+fn read_kimi_code_credentials_from(
+    home: &std::path::Path,
+    environment: &KimiCodeEnvironment,
+    now: f64,
+) -> Result<KimiCodeCredentials, PollError> {
+    let plan = kimi_code_auth_plan_from(home, environment).ok_or(PollError::NoCredentials)?;
+    let access_token = match plan.source {
+        KimiCodeTokenSource::ApiKey(token) => token,
+        KimiCodeTokenSource::OAuth(path) => {
+            let token = read_kimi_code_token_file(&path).ok_or(PollError::NoCredentials)?;
+            let access_token =
+                cleaned_kimi_code_value(token.access_token).ok_or(PollError::NoCredentials)?;
+            let expires_at = token
+                .expires_at
+                .as_ref()
+                .and_then(kimi_code_numeric_value)
+                .ok_or(PollError::TokenExpired)?;
+            if expires_at <= now + 60.0 {
+                return Err(PollError::TokenExpired);
+            }
+            access_token
+        }
+    };
+    Ok(KimiCodeCredentials {
+        access_token,
+        base_url: plan.base_url,
+    })
+}
+
+fn kimi_code_credential_watch_snapshot() -> CredentialWatchSnapshot {
+    let signature = kimi_credentials::watch_signature();
+    if signature != "kimi-key|missing" {
+        return vec![signature];
+    }
+    let Some(home) = kimi_code_home() else {
+        return vec![signature];
+    };
+    let environment = kimi_code_environment();
+    let mut snapshot = vec![signature];
+    if let Some(plan) = kimi_code_auth_plan_from(&home, &environment) {
+        snapshot.push(windows_credential_watch_signature(&plan.config_path));
+        if let KimiCodeTokenSource::OAuth(path) = plan.source {
+            snapshot.push(windows_credential_watch_signature(&path));
+        }
+    } else {
+        snapshot.push(windows_credential_watch_signature(
+            &home.join("config.toml"),
+        ));
+    }
+    snapshot.sort();
+    snapshot.dedup();
+    snapshot
 }
 
 fn read_antigravity_credentials() -> Option<AntigravityTokenData> {
@@ -1506,22 +2056,52 @@ fn is_token_expired(expires_at: Option<i64>) -> bool {
     now >= exp
 }
 
-/// Parse an ISO 8601 timestamp string into a SystemTime.
+/// Parse an ISO 8601 / RFC 3339 timestamp into an absolute SystemTime.
 fn parse_iso8601(s: Option<&str>) -> Option<SystemTime> {
-    let s = s?;
-    // Strip timezone offset to get "YYYY-MM-DDTHH:MM:SS" or with fractional seconds
-    // The API returns formats like "2026-03-05T08:00:00.321598+00:00"
-    let datetime_part = s.split('+').next().unwrap_or(s);
-    let datetime_part = datetime_part.split('Z').next().unwrap_or(datetime_part);
+    let s = s?.trim();
+    let time_start = s.find('T')?;
+    let offset_start = s
+        .char_indices()
+        .skip(time_start + 1)
+        .find(|(_, character)| matches!(character, '+' | '-'))
+        .map(|(index, _)| index);
+    let (datetime_part, offset_seconds) = if let Some(index) = offset_start {
+        let (datetime, offset) = s.split_at(index);
+        (datetime, parse_iso8601_offset(offset)?)
+    } else if let Some(datetime) = s.strip_suffix('Z').or_else(|| s.strip_suffix('z')) {
+        (datetime, 0)
+    } else {
+        (s, 0)
+    };
+    let local_seconds: i64 = parse_datetime_to_unix(datetime_part, "%Y-%m-%dT%H:%M:%S%.f")
+        .ok()?
+        .try_into()
+        .ok()?;
+    unix_to_system_time(Some(local_seconds.checked_sub(offset_seconds)?))
+}
 
-    // Try parsing with and without fractional seconds
-    let formats = ["%Y-%m-%dT%H:%M:%S%.f", "%Y-%m-%dT%H:%M:%S"];
-    for fmt in &formats {
-        if let Ok(secs) = parse_datetime_to_unix(datetime_part, fmt) {
-            return Some(UNIX_EPOCH + Duration::from_secs(secs));
-        }
+fn parse_iso8601_offset(value: &str) -> Option<i64> {
+    let (sign, value) = match value.as_bytes().first()? {
+        b'+' => (1i64, &value[1..]),
+        b'-' => (-1i64, &value[1..]),
+        _ => return None,
+    };
+    let bytes = value.as_bytes();
+    if bytes.len() != 5
+        || bytes[2] != b':'
+        || !bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| index == 2 || byte.is_ascii_digit())
+    {
+        return None;
     }
-    None
+    let hours = i64::from(bytes[0] - b'0') * 10 + i64::from(bytes[1] - b'0');
+    let minutes = i64::from(bytes[3] - b'0') * 10 + i64::from(bytes[4] - b'0');
+    if hours > 23 || minutes > 59 {
+        return None;
+    }
+    Some(sign * (hours * 3600 + minutes * 60))
 }
 
 /// Minimal datetime parser — avoids pulling in chrono/time crates.
@@ -1547,6 +2127,21 @@ fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
     let hour: u64 = time_parts[0].parse().map_err(|_| ())?;
     let min: u64 = time_parts[1].parse().map_err(|_| ())?;
     let sec: u64 = time_parts[2].parse().map_err(|_| ())?;
+    if !(1970..=9999).contains(&year)
+        || !(1..=12).contains(&month)
+        || hour > 23
+        || min > 59
+        || sec > 59
+    {
+        return Err(());
+    }
+    let mut days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if is_leap(year) {
+        days_in_month[1] = 29;
+    }
+    if day == 0 || day > days_in_month[(month - 1) as usize] {
+        return Err(());
+    }
 
     // Days from year (using a simplified calculation for dates after 1970)
     let mut days: u64 = 0;
@@ -1570,15 +2165,14 @@ fn is_leap(y: u64) -> bool {
     (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
 }
 
-/// Codex leaves absent windows as default sections. Its reported windows
-/// include a reset timestamp, including windows with zero usage.
+/// Format optional Codex/Kimi quota windows without inventing missing quotas.
 pub fn format_codex_line(
     section: &UsageSection,
     strings: Strings,
     show_remaining_in_chinese: bool,
     window: UsageWindowKind,
 ) -> String {
-    if section.percentage == 0.0 && section.resets_at.is_none() {
+    if !section.reported && section.percentage == 0.0 && section.resets_at.is_none() {
         return "--".to_string();
     }
     format_line(section, strings, show_remaining_in_chinese, window)
@@ -1864,6 +2458,7 @@ mod tests {
         let section = UsageSection {
             percentage: 30.0,
             resets_at: None,
+            reported: true,
         };
         assert_eq!(
             format_line(&section, strings, true, UsageWindowKind::Session),
@@ -1943,5 +2538,368 @@ mod tests {
         assert!((usage.session.percentage - 4.17425).abs() < 0.000001);
         assert!(usage.weekly.resets_at.is_some());
         assert!(usage.session.resets_at.is_some());
+    }
+
+    #[test]
+    fn iso8601_offsets_are_converted_to_utc() {
+        let utc = parse_iso8601(Some("2026-01-01T00:30:00Z"));
+        assert_eq!(parse_iso8601(Some("2026-01-01T01:30:00+01:00")), utc);
+        assert_eq!(parse_iso8601(Some("2025-12-31T19:30:00-05:00")), utc);
+        assert!(parse_iso8601(Some("2026-13-01T00:30:00Z")).is_none());
+        assert!(parse_iso8601(Some("2026-01-01T00:30:00+0é:00")).is_none());
+    }
+
+    fn kimi_usage(json: &str) -> Option<UsageData> {
+        serde_json::from_str::<KimiCodeUsageResponse>(json)
+            .ok()
+            .and_then(kimi_code_usage_from_response)
+    }
+
+    fn kimi_test_home(name: &str) -> PathBuf {
+        let home =
+            std::env::temp_dir().join(format!("codex-usage-kimi-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    #[test]
+    fn kimi_ratio_pools_parse_session_weekly_and_missing_windows() {
+        let usage = kimi_usage(
+            r#"{
+                "usages": {
+                    "limit_5h": {"used_ratio": 0.625, "reset_time": "2026-09-19T14:45:59.449979235Z"},
+                    "limit_7d": {"used_ratio": "0.125", "reset_time": "2026-09-20T00:00:00Z"}
+                }
+            }"#,
+        )
+        .expect("ratio pools should be usable");
+        assert_eq!(usage.session.percentage, 62.5);
+        assert_eq!(usage.weekly.percentage, 12.5);
+        assert!(usage.session.resets_at.is_some());
+        assert!(usage.weekly.resets_at.is_some());
+
+        let session_only = kimi_usage(
+            r#"{"usages":{"limit_5h":{"used_ratio":0.4,"reset_time":"2026-09-19T14:45:59Z"}}}"#,
+        )
+        .expect("new plans can omit the weekly window");
+        assert_eq!(session_only.session.percentage, 40.0);
+        assert_eq!(session_only.weekly.percentage, 0.0);
+        assert!(session_only.weekly.resets_at.is_none());
+        assert_eq!(
+            format_codex_line(
+                &session_only.weekly,
+                crate::localization::LanguageId::English.strings(),
+                false,
+                UsageWindowKind::Weekly,
+            ),
+            "--"
+        );
+    }
+
+    #[test]
+    fn kimi_zero_usage_without_reset_is_not_a_missing_window() {
+        let usage = kimi_usage(r#"{"usages":{"limit_5h":{"used_ratio":0}}}"#).unwrap();
+        assert!(usage.session.reported);
+        assert!(!usage.weekly.reported);
+        let strings = crate::localization::LanguageId::English.strings();
+        assert_eq!(
+            format_codex_line(&usage.session, strings, false, UsageWindowKind::Session),
+            "0%"
+        );
+        assert_eq!(
+            format_codex_line(&usage.session, strings, true, UsageWindowKind::Session),
+            "100%"
+        );
+        assert_eq!(
+            format_codex_line(&usage.weekly, strings, false, UsageWindowKind::Weekly),
+            "--"
+        );
+    }
+
+    #[test]
+    fn kimi_legacy_counts_support_both_windows_and_remaining_fallback() {
+        let usage = kimi_usage(
+            r#"{
+                "usage": {"limit": "100", "used": "19", "resetTime": "2026-09-19T16:45:59Z"},
+                "limits": [{
+                    "window": {"duration": 5, "timeUnit": "TIME_UNIT_HOUR"},
+                    "detail": {"limit": 100, "remaining": 75, "resetTime": "2026-09-19T14:45:59Z"}
+                }]
+            }"#,
+        )
+        .expect("legacy counters should be usable");
+        assert_eq!(usage.session.percentage, 25.0);
+        assert_eq!(usage.weekly.percentage, 19.0);
+        assert!(usage.session.resets_at.is_some());
+        assert!(usage.weekly.resets_at.is_some());
+    }
+
+    #[test]
+    fn kimi_matching_ratio_and_count_windows_use_the_more_exhausted_reading() {
+        let usage = kimi_usage(
+            r#"{
+                "usage": {"limit": "100", "used": "19", "resetTime": "2026-09-19T16:45:59.449979Z"},
+                "limits": [{
+                    "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                    "detail": {"limit": "100", "used": "1", "resetTime": "2026-09-19T14:45:59.449979Z"}
+                }],
+                "usages": {
+                    "limit_5h": {"used_ratio": 0, "reset_time": "2026-09-19T14:45:58Z"},
+                    "limit_7d": {"used_ratio": 0.1, "reset_time": "2026-09-19T16:45:59Z"}
+                }
+            }"#,
+        )
+        .expect("mixed response should be usable");
+        assert_eq!(usage.session.percentage, 1.0);
+        assert_eq!(usage.weekly.percentage, 19.0);
+    }
+
+    #[test]
+    fn kimi_invalid_or_unrelated_quotas_are_not_reported_as_unused() {
+        for json in [
+            "{}",
+            r#"{"usages":{}}"#,
+            r#"{"usages":{"limit_month_total":{"used_ratio":0.5}}}"#,
+            r#"{"usages":{"limit_5h":{"used_ratio":-0.5}}}"#,
+        ] {
+            assert!(kimi_usage(json).is_none(), "unexpected quota for {json}");
+        }
+    }
+
+    #[test]
+    fn kimi_global_config_uses_the_scoped_oauth_credential() {
+        let home = kimi_test_home("global");
+        std::fs::create_dir_all(home.join("credentials")).unwrap();
+        std::fs::write(
+            home.join("config.toml"),
+            r#"
+[providers."managed:kimi-code"]
+base_url = "https://api.kimi.ai/coding/v1"
+api_key = ""
+[providers."managed:kimi-code".oauth]
+storage = "file"
+key = "oauth/kimi-code-env-0e4f99c69cc27850"
+oauthHost = "https://auth.kimi.ai"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            kimi_code_credential_name("https://auth.kimi.ai", "https://api.kimi.ai/coding/v1",),
+            "kimi-code-env-0e4f99c69cc27850"
+        );
+        std::fs::write(
+            home.join("credentials")
+                .join("kimi-code-env-0e4f99c69cc27850.json"),
+            r#"{"access_token":"global-token","refresh_token":"refresh","expires_at":2000}"#,
+        )
+        .unwrap();
+
+        let credentials =
+            read_kimi_code_credentials_from(&home, &KimiCodeEnvironment::default(), 1000.0)
+                .expect("global OAuth credential should be accepted");
+        assert_eq!(credentials.access_token, "global-token");
+        assert_eq!(credentials.base_url, "https://api.kimi.ai/coding/v1");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn kimi_api_key_environment_takes_precedence_without_a_credential_file() {
+        let home = kimi_test_home("api-key");
+        std::fs::write(
+            home.join("config.toml"),
+            r#"
+[providers."managed:kimi-code"]
+base_url = "https://api.kimi.com/coding/v1"
+api_key = "config-key"
+"#,
+        )
+        .unwrap();
+        let environment = KimiCodeEnvironment {
+            api_key: Some("environment-key".into()),
+            ..KimiCodeEnvironment::default()
+        };
+        let credentials = read_kimi_code_credentials_from(&home, &environment, 1000.0)
+            .expect("explicit API key should not need OAuth files");
+        assert_eq!(credentials.access_token, "environment-key");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn kimi_expired_oauth_token_requires_cli_renewal() {
+        let home = kimi_test_home("expired");
+        std::fs::create_dir_all(home.join("credentials")).unwrap();
+        std::fs::write(
+            home.join("credentials").join("kimi-code.json"),
+            r#"{"access_token":"expired-token","refresh_token":"refresh","expires_at":1000}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_kimi_code_credentials_from(&home, &KimiCodeEnvironment::default(), 1000.0).err(),
+            Some(PollError::TokenExpired)
+        );
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn kimi_default_and_unsafe_credential_endpoints_are_validated() {
+        let home = kimi_test_home("endpoints");
+        let plan = kimi_code_auth_plan_from(&home, &KimiCodeEnvironment::default())
+            .expect("default plan should be available");
+        assert_eq!(plan.base_url, KIMI_CODE_DEFAULT_BASE_URL);
+        match plan.source {
+            KimiCodeTokenSource::OAuth(path) => {
+                assert_eq!(path, home.join("credentials").join("kimi-code.json"));
+            }
+            KimiCodeTokenSource::ApiKey(_) => panic!("OAuth should be the default source"),
+        }
+        let insecure = KimiCodeEnvironment {
+            base_url: Some("http://api.kimi.com/coding/v1".into()),
+            ..KimiCodeEnvironment::default()
+        };
+        assert!(kimi_code_auth_plan_from(&home, &insecure).is_none());
+        for url in [
+            "http://api.kimi.com/coding/v1",
+            "https://user:password@api.kimi.com/coding/v1",
+            "https://api.kimi.com/coding/v1?token=value",
+            "https://api.kimi.com/coding/v1#fragment",
+            "https://api.kimi.com\\other/path",
+            "https://api.kimi.com/with space",
+        ] {
+            assert!(
+                normalize_kimi_code_base_url(url).is_none(),
+                "accepted unsafe URL: {url}"
+            );
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn kimi_endpoint_override_never_reuses_a_config_api_key_or_default_oauth_token() {
+        let home = kimi_test_home("override");
+        std::fs::write(
+            home.join("config.toml"),
+            r#"
+[providers."managed:kimi-code"]
+base_url = "https://api.kimi.com/coding/v1"
+api_key = "config-key"
+"#,
+        )
+        .unwrap();
+        let override_env = KimiCodeEnvironment {
+            base_url: Some("https://gateway.example.test/coding/v1".into()),
+            ..KimiCodeEnvironment::default()
+        };
+        let plan = kimi_code_auth_plan_from(&home, &override_env).unwrap();
+        match plan.source {
+            KimiCodeTokenSource::OAuth(path) => {
+                assert_ne!(path.file_name().unwrap(), "kimi-code.json")
+            }
+            KimiCodeTokenSource::ApiKey(_) => {
+                panic!("must not forward a config key to another endpoint")
+            }
+        }
+        let explicit_key = KimiCodeEnvironment {
+            api_key: Some("explicit-gateway-key".into()),
+            ..override_env
+        };
+        let credentials = read_kimi_code_credentials_from(&home, &explicit_key, 1000.0).unwrap();
+        assert_eq!(credentials.access_token, "explicit-gateway-key");
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn kimi_invalid_config_and_unknown_expiry_cannot_reuse_old_credentials() {
+        let home = kimi_test_home("invalid-config");
+        std::fs::create_dir_all(home.join("credentials")).unwrap();
+        std::fs::write(
+            home.join("credentials/kimi-code.json"),
+            r#"{"access_token":"old-token","expires_at":2000}"#,
+        )
+        .unwrap();
+        for config in [
+            "invalid TOML [",
+            "[providers.\"managed:kimi-code\".oauth]\nkey = \"oauth/../other\"",
+            "[providers.\"managed:kimi-code\".oauth]\nstorage = \"keyring\"",
+        ] {
+            std::fs::write(home.join("config.toml"), config).unwrap();
+            assert!(kimi_code_auth_plan_from(&home, &KimiCodeEnvironment::default()).is_none());
+        }
+        std::fs::remove_file(home.join("config.toml")).unwrap();
+        for token in [
+            r#"{"access_token":"token"}"#,
+            r#"{"access_token":"token","expires_at":"invalid"}"#,
+        ] {
+            std::fs::write(home.join("credentials/kimi-code.json"), token).unwrap();
+            assert_eq!(
+                read_kimi_code_credentials_from(&home, &KimiCodeEnvironment::default(), 1000.0)
+                    .err(),
+                Some(PollError::TokenExpired)
+            );
+        }
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn kimi_usage_http_request_is_read_only_and_does_not_follow_redirects() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let agent = ureq::AgentBuilder::new()
+            .try_proxy_from_env(false)
+            .timeout(Duration::from_secs(5))
+            .redirects(0)
+            .build();
+        for (status, headers, body, expected) in [
+            (
+                "200 OK",
+                "",
+                r#"{"usages":{"limit_5h":{"used_ratio":0.25}}}"#,
+                None,
+            ),
+            ("401 Unauthorized", "", "{}", Some(PollError::AuthRequired)),
+            (
+                "429 Too Many Requests",
+                "Retry-After: 120\r\n",
+                "{}",
+                Some(PollError::RateLimited(Some(120_000))),
+            ),
+            ("503 Unavailable", "", "{}", Some(PollError::ServerError)),
+            (
+                "302 Found",
+                "Location: http://127.0.0.1:1/never-forward-token\r\n",
+                "{}",
+                Some(PollError::RequestFailed),
+            ),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    let mut buffer = [0u8; 1024];
+                    let length = socket.read(&mut buffer).unwrap();
+                    assert_ne!(length, 0);
+                    request.extend_from_slice(&buffer[..length]);
+                }
+                write!(socket, "HTTP/1.1 {status}\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                String::from_utf8(request).unwrap()
+            });
+            let result = fetch_kimi_code_usage_with_agent(
+                "fixture-token",
+                &format!("http://{address}/coding/v1"),
+                &agent,
+            );
+            let request = server.join().unwrap().to_ascii_lowercase();
+            assert!(request.starts_with("get /coding/v1/usages http/1.1\r\n"));
+            assert!(request.contains("authorization: bearer fixture-token\r\n"));
+            assert_eq!(result.as_ref().err().copied(), expected, "status: {status}");
+            if let Ok(usage) = result {
+                assert_eq!(usage.session.percentage, 25.0);
+            }
+        }
     }
 }

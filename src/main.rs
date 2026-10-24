@@ -1,6 +1,8 @@
 #![windows_subsystem = "windows"]
 
 mod diagnose;
+mod kimi_credentials;
+mod kimi_key_dialog;
 mod localization;
 mod models;
 mod native_interop;

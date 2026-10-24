@@ -14,6 +14,7 @@ pub const RIGHT_MARGIN: i32 = 5;
 pub enum Provider {
     Claude,
     Codex,
+    KimiCode,
 }
 
 pub fn codex_color(is_dark: bool) -> Color {
@@ -21,13 +22,15 @@ pub fn codex_color(is_dark: bool) -> Color {
 }
 
 pub fn draw(hdc: HDC, x: i32, y: i32, size: i32, provider: Provider) {
-    // These two handles live for the process lifetime. DrawIconEx scales the
+    // These handles live for the process lifetime. DrawIconEx scales the
     // embedded 64px artwork to the current monitor's DPI without disk access.
     static CLAUDE: OnceLock<isize> = OnceLock::new();
     static CODEX: OnceLock<isize> = OnceLock::new();
+    static KIMI_CODE: OnceLock<isize> = OnceLock::new();
     let (cache, png): (&OnceLock<isize>, &[u8]) = match provider {
         Provider::Claude => (&CLAUDE, include_bytes!("icons/providers/claude.png")),
         Provider::Codex => (&CODEX, include_bytes!("icons/providers/openai.png")),
+        Provider::KimiCode => (&KIMI_CODE, include_bytes!("icons/providers/kimi.png")),
     };
     let handle = *cache.get_or_init(|| unsafe {
         CreateIconFromResourceEx(png, true, 0x00030000, 64, 64, LR_DEFAULTCOLOR)

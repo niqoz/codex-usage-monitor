@@ -14,6 +14,7 @@ pub(super) const STRINGS: Strings = Strings {
     claude_code_model: "Claude Code",
     codex_model: "Codex",
     antigravity_model: "Antigravity",
+    kimi_code_model: "Kimi Code",
     settings: "設定",
     start_with_windows: "Windows と同時に開始",
     reset_position: "位置をリセット",
@@ -44,7 +45,10 @@ pub(super) const STRINGS: Strings = Strings {
     codex_token_expired_body: "ターミナルで 'codex' を実行し、サインインの案内に従ってください。その後、このアプリを更新または再起動してください。",
     antigravity_token_expired_title: "Antigravity 認証エラー",
     antigravity_token_expired_body: "Antigravity を開いて再度サインインしてください。その後、このアプリを更新するか再起動してください。",
+    kimi_code_token_expired_title: "Kimi Code 認証エラー",
+    kimi_code_token_expired_body: "ターミナルで 'kimi' を実行し、'/login' を使用してください。その後、このアプリを更新するか再起動してください。",
     codex_window_title: "Codex 使用量モニター",
     antigravity_window_title: "Antigravity 使用量モニター",
+    kimi_code_window_title: "Kimi Code 使用量モニター",
     second_suffix: "秒",
 };

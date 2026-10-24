@@ -18,6 +18,7 @@ use windows::Win32::UI::Shell::ExtractIconExW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::diagnose;
+use crate::kimi_key_dialog;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
@@ -76,10 +77,16 @@ struct AppState {
     antigravity_session_text: String,
     antigravity_weekly_percent: f64,
     antigravity_weekly_text: String,
+    kimi_code_session_percent: f64,
+    kimi_code_session_text: String,
+    kimi_code_weekly_percent: f64,
+    kimi_code_weekly_text: String,
     claude_code_available: bool,
+    kimi_code_available: bool,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_kimi_code: bool,
     show_session_window: bool,
     show_weekly_window: bool,
     alert_threshold_percent: u8,
@@ -147,6 +154,8 @@ const IDM_LANG_SIMPLIFIED_CHINESE: u16 = 51;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
+const IDM_MODEL_KIMI_CODE: u16 = 63;
+const IDM_KIMI_API_KEY: u16 = 64;
 const IDM_SHOW_SESSION_WINDOW: u16 = 71;
 const IDM_SHOW_WEEKLY_WINDOW: u16 = 72;
 const IDM_ALERT_OFF: u16 = 80;
@@ -450,6 +459,8 @@ struct SettingsFile {
     show_codex: bool,
     #[serde(default = "default_show_antigravity")]
     show_antigravity: bool,
+    #[serde(default = "default_show_kimi_code")]
+    show_kimi_code: bool,
     #[serde(default = "default_show_usage_window")]
     show_session_window: bool,
     #[serde(default = "default_show_usage_window")]
@@ -476,6 +487,7 @@ impl Default for SettingsFile {
             show_claude_code: false,
             show_codex: true,
             show_antigravity: false,
+            show_kimi_code: false,
             show_session_window: true,
             show_weekly_window: true,
             alert_threshold_percent: 0,
@@ -508,11 +520,15 @@ fn default_show_antigravity() -> bool {
     false
 }
 
+fn default_show_kimi_code() -> bool {
+    false
+}
+
 fn default_show_usage_window() -> bool {
     true
 }
 
-fn load_settings(claude_code_available: bool) -> SettingsFile {
+fn load_settings(claude_code_available: bool, kimi_code_available: bool) -> SettingsFile {
     let current_path = settings_path();
     let legacy_path = legacy_settings_path();
     let (settings, migrated) = load_settings_from_paths(&current_path, &legacy_path)
@@ -520,7 +536,9 @@ fn load_settings(claude_code_available: bool) -> SettingsFile {
     let settings = normalize_settings(settings);
     let (settings, claude_auto_disabled) =
         apply_claude_code_availability(settings, claude_code_available);
-    if migrated || claude_auto_disabled {
+    let (settings, kimi_auto_disabled) =
+        apply_kimi_code_availability(settings, kimi_code_available);
+    if migrated || claude_auto_disabled || kimi_auto_disabled {
         save_settings(&settings);
         if migrated {
             diagnose::log(format!(
@@ -534,6 +552,9 @@ fn load_settings(claude_code_available: bool) -> SettingsFile {
                 "disabled Claude Code monitoring because no CLI credentials are available",
             );
         }
+        if kimi_auto_disabled {
+            diagnose::log("disabled Kimi Code monitoring because no CLI credentials are available");
+        }
     }
     settings
 }
@@ -545,6 +566,18 @@ fn apply_claude_code_availability(
     let disabled = settings.show_claude_code && !claude_code_available;
     if disabled {
         settings.show_claude_code = false;
+        settings = normalize_settings(settings);
+    }
+    (settings, disabled)
+}
+
+fn apply_kimi_code_availability(
+    mut settings: SettingsFile,
+    kimi_code_available: bool,
+) -> (SettingsFile, bool) {
+    let disabled = settings.show_kimi_code && !kimi_code_available;
+    if disabled {
+        settings.show_kimi_code = false;
         settings = normalize_settings(settings);
     }
     (settings, disabled)
@@ -570,7 +603,11 @@ fn normalize_settings(mut settings: SettingsFile) -> SettingsFile {
     if !(POLL_1_MIN..=POLL_1_HOUR).contains(&settings.poll_interval_ms) {
         settings.poll_interval_ms = POLL_15_MIN;
     }
-    if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
+    if !settings.show_claude_code
+        && !settings.show_codex
+        && !settings.show_antigravity
+        && !settings.show_kimi_code
+    {
         settings.show_codex = true;
     }
     if !settings.show_session_window && !settings.show_weekly_window {
@@ -609,6 +646,7 @@ fn save_state_settings() {
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
             show_antigravity: s.show_antigravity,
+            show_kimi_code: s.show_kimi_code,
             show_session_window: s.show_session_window,
             show_weekly_window: s.show_weekly_window,
             alert_threshold_percent: s.alert_threshold_percent,
@@ -649,6 +687,52 @@ fn service_tooltip(
     format!("{service}: {}", parts.join(" | "))
 }
 
+fn tray_services_tooltip(
+    services: &[(&str, &str, &str)],
+    show_session_window: bool,
+    show_weekly_window: bool,
+) -> String {
+    let full = services
+        .iter()
+        .map(|(name, session, weekly)| {
+            service_tooltip(
+                name,
+                session,
+                weekly,
+                show_session_window,
+                show_weekly_window,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    // NOTIFYICONDATAW.szTip has room for 127 UTF-16 units plus its terminator.
+    // Drop reset text before Windows would truncate the last provider entirely.
+    if full.encode_utf16().count() <= 127 {
+        return full;
+    }
+    let compact = |text: &str| {
+        let value = text.split_whitespace().next().unwrap_or(text);
+        if text.ends_with(" *") {
+            format!("{value}*")
+        } else {
+            value.to_string()
+        }
+    };
+    services
+        .iter()
+        .map(|(name, session, weekly)| {
+            service_tooltip(
+                name,
+                &compact(session),
+                &compact(weekly),
+                show_session_window,
+                show_weekly_window,
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn claude_code_menu_label(
     strings: Strings,
     language: LanguageId,
@@ -660,6 +744,22 @@ fn claude_code_menu_label(
         "Claude Code（需登录 CLI）".to_string()
     } else {
         "Claude Code (CLI login required)".to_string()
+    }
+}
+
+fn kimi_code_menu_label(
+    strings: Strings,
+    language: LanguageId,
+    kimi_code_available: bool,
+) -> String {
+    if kimi_code_available {
+        strings.kimi_code_model.to_string()
+    } else if language == LanguageId::SimplifiedChinese {
+        "Kimi Code（需 API Key 或登录 CLI）".to_string()
+    } else if language == LanguageId::French {
+        "Kimi Code (clé API ou connexion CLI requise)".to_string()
+    } else {
+        "Kimi Code (API key or CLI login required)".to_string()
     }
 }
 
@@ -717,6 +817,21 @@ fn collect_low_quota_alerts(state: &mut AppState, data: &AppUsageData) -> Vec<Qu
                 tray_icon::TrayIconKind::Antigravity,
                 "antigravity",
                 strings.antigravity_model,
+                usage,
+                strings,
+            );
+        }
+    }
+    if state.show_kimi_code {
+        if let Some(usage) = data.kimi_code.as_ref() {
+            append_provider_alerts(
+                &mut alerts,
+                &mut state.notified_quota_windows,
+                threshold,
+                state.language,
+                tray_icon::TrayIconKind::KimiCode,
+                "kimi_code",
+                strings.kimi_code_model,
                 usage,
                 strings,
             );
@@ -821,46 +936,55 @@ fn tray_icon_data_from_state() -> Option<tray_icon::TrayIconData> {
         Some(s) if s.has_poll_result => {
             let mut services = Vec::new();
             let strings = s.language.strings();
-            if s.show_claude_code {
-                services.push(service_tooltip(
+            for (visible, name, session, weekly) in [
+                (
+                    s.show_claude_code,
                     strings.claude_code_model,
                     &s.session_text,
                     &s.weekly_text,
-                    s.show_session_window,
-                    s.show_weekly_window,
-                ));
-            }
-            if s.show_codex {
-                services.push(service_tooltip(
+                ),
+                (
+                    s.show_codex,
                     strings.codex_model,
                     &s.codex_session_text,
                     &s.codex_weekly_text,
-                    s.show_session_window,
-                    s.show_weekly_window,
-                ));
-            }
-            if s.show_antigravity {
-                services.push(service_tooltip(
+                ),
+                (
+                    s.show_antigravity,
                     strings.antigravity_model,
                     &s.antigravity_session_text,
                     &s.antigravity_weekly_text,
-                    s.show_session_window,
-                    s.show_weekly_window,
-                ));
+                ),
+                (
+                    s.show_kimi_code,
+                    strings.kimi_code_model,
+                    &s.kimi_code_session_text,
+                    &s.kimi_code_weekly_text,
+                ),
+            ] {
+                if visible {
+                    services.push((name, session.as_str(), weekly.as_str()));
+                }
             }
             Some(tray_icon::TrayIconData {
                 tooltip: if services.is_empty() {
                     strings.window_title.to_string()
                 } else {
-                    services.join("\n")
+                    tray_services_tooltip(&services, s.show_session_window, s.show_weekly_window)
                 },
             })
         }
         Some(s) => {
             let strings = s.language.strings();
-            let tooltip = match (s.show_claude_code, s.show_codex, s.show_antigravity) {
-                (false, true, false) => strings.codex_window_title,
-                (false, false, true) => strings.antigravity_window_title,
+            let tooltip = match (
+                s.show_claude_code,
+                s.show_codex,
+                s.show_antigravity,
+                s.show_kimi_code,
+            ) {
+                (false, true, false, false) => strings.codex_window_title,
+                (false, false, true, false) => strings.antigravity_window_title,
+                (false, false, false, true) => strings.kimi_code_window_title,
                 _ => strings.window_title,
             };
             Some(tray_icon::TrayIconData {
@@ -1158,6 +1282,29 @@ fn refresh_usage_texts(state: &mut AppState) {
         state.antigravity_session_text = label.to_string();
         state.antigravity_weekly_text = label.to_string();
     }
+
+    if let Some(kimi_code) = data.kimi_code.as_ref() {
+        state.kimi_code_session_text = poller::format_codex_line(
+            &kimi_code.session,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Session,
+        );
+        state.kimi_code_weekly_text = poller::format_codex_line(
+            &kimi_code.weekly,
+            strings,
+            show_remaining,
+            poller::UsageWindowKind::Weekly,
+        );
+    } else if state.show_kimi_code {
+        let label = state.monitor.services[3]
+            .error
+            .map(|e| poll_error_display_label(e, state.language))
+            .unwrap_or("...");
+        state.kimi_code_session_text = label.to_string();
+        state.kimi_code_weekly_text = label.to_string();
+    }
+
     for (id, session, weekly) in [
         (0, &mut state.session_text, &mut state.weekly_text),
         (
@@ -1169,6 +1316,11 @@ fn refresh_usage_texts(state: &mut AppState) {
             2,
             &mut state.antigravity_session_text,
             &mut state.antigravity_weekly_text,
+        ),
+        (
+            3,
+            &mut state.kimi_code_session_text,
+            &mut state.kimi_code_weekly_text,
         ),
     ] {
         let stale = state.monitor.services[id].stale(SystemTime::now());
@@ -1645,8 +1797,14 @@ fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
     }
 }
 
-fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
-    (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
+fn active_model_count(
+    show_claude_code: bool,
+    show_codex: bool,
+    show_antigravity: bool,
+    show_kimi_code: bool,
+) -> i32 {
+    (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32 + show_kimi_code as i32)
+        .max(1)
 }
 
 fn row_bar_segment_count(active_models: i32) -> i32 {
@@ -1784,6 +1942,7 @@ fn total_widget_width_for_state(state: &AppState) -> i32 {
             state.show_claude_code,
             state.show_codex,
             state.show_antigravity,
+            state.show_kimi_code,
         ),
         state.language,
         state.appearance,
@@ -1797,7 +1956,12 @@ fn total_widget_width() -> i32 {
             .as_ref()
             .map(|s| {
                 (
-                    active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity),
+                    active_model_count(
+                        s.show_claude_code,
+                        s.show_codex,
+                        s.show_antigravity,
+                        s.show_kimi_code,
+                    ),
                     s.language,
                     s.appearance,
                 )
@@ -1850,6 +2014,10 @@ fn antigravity_accent_color() -> Color {
     Color::from_hex("#4285F4")
 }
 
+fn kimi_code_accent_color() -> Color {
+    Color::from_hex("#1783FF")
+}
+
 fn claude_usage_text_color(is_dark: bool) -> Color {
     if is_dark {
         Color::from_hex("#F09A7A")
@@ -1863,6 +2031,14 @@ fn antigravity_usage_text_color(is_dark: bool) -> Color {
         Color::from_hex("#8AB4F8")
     } else {
         Color::from_hex("#1967D2")
+    }
+}
+
+fn kimi_code_usage_text_color(is_dark: bool) -> Color {
+    if is_dark {
+        Color::from_hex("#7DB4FF")
+    } else {
+        Color::from_hex("#0B63D8")
     }
 }
 
@@ -1937,7 +2113,8 @@ pub fn run() {
         }
 
         let claude_code_available = poller::claude_code_credentials_available();
-        let settings = load_settings(claude_code_available);
+        let kimi_code_available = poller::kimi_code_credentials_available();
+        let settings = load_settings(claude_code_available, kimi_code_available);
         let language_override = settings.language.as_deref().and_then(LanguageId::from_code);
         let language = localization::resolve_language(language_override);
         let install_channel = updater::current_install_channel();
@@ -1948,6 +2125,7 @@ pub fn run() {
             settings.show_claude_code,
             settings.show_codex,
             settings.show_antigravity,
+            settings.show_kimi_code,
         );
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
@@ -2012,10 +2190,16 @@ pub fn run() {
                 antigravity_session_text: "--".to_string(),
                 antigravity_weekly_percent: 0.0,
                 antigravity_weekly_text: "--".to_string(),
+                kimi_code_session_percent: 0.0,
+                kimi_code_session_text: "--".to_string(),
+                kimi_code_weekly_percent: 0.0,
+                kimi_code_weekly_text: "--".to_string(),
                 claude_code_available,
+                kimi_code_available,
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
                 show_antigravity: settings.show_antigravity,
+                show_kimi_code: settings.show_kimi_code,
                 show_session_window: settings.show_session_window,
                 show_weekly_window: settings.show_weekly_window,
                 alert_threshold_percent: settings.alert_threshold_percent,
@@ -2028,6 +2212,7 @@ pub fn run() {
                         settings.show_claude_code,
                         settings.show_codex,
                         settings.show_antigravity,
+                        settings.show_kimi_code,
                     ],
                     Instant::now(),
                 ),
@@ -2143,7 +2328,12 @@ fn update_quota_tooltips() {
         let mut regions = Vec::new();
         if !s.dragging {
             let chinese = s.language == LanguageId::SimplifiedChinese;
-            let count = active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity);
+            let count = active_model_count(
+                s.show_claude_code,
+                s.show_codex,
+                s.show_antigravity,
+                s.show_kimi_code,
+            );
             let (label_width, text_width) = usage_layout_widths(s.language, s.appearance);
             let width = model_usage_width(row_bar_segment_count(count), text_width);
             let mut left = sc(LEFT_DIVIDER_W)
@@ -2172,6 +2362,13 @@ fn update_quota_tooltips() {
                     &s.antigravity_session_text,
                     &s.antigravity_weekly_text,
                 ),
+                (
+                    3,
+                    s.show_kimi_code,
+                    "Kimi Code",
+                    &s.kimi_code_session_text,
+                    &s.kimi_code_weekly_text,
+                ),
             ] {
                 if !visible {
                     continue;
@@ -2186,7 +2383,7 @@ fn update_quota_tooltips() {
                         "\nThis provider did not return quota in the latest update."
                     });
                 }
-                if name == "Codex" && s.monitor.services[id].data.is_some() {
+                if matches!(id, 1 | 3) && s.monitor.services[id].data.is_some() {
                     for (missing, is_weekly) in [(session == "--", false), (weekly == "--", true)] {
                         if missing {
                             text.push('\n');
@@ -2234,9 +2431,14 @@ fn render_layered() {
         antigravity_session_text,
         antigravity_weekly_pct,
         antigravity_weekly_text,
+        kimi_code_session_pct,
+        kimi_code_session_text,
+        kimi_code_weekly_pct,
+        kimi_code_weekly_text,
         show_claude_code,
         show_codex,
         show_antigravity,
+        show_kimi_code,
         show_session_window,
         show_weekly_window,
     ) = {
@@ -2261,9 +2463,14 @@ fn render_layered() {
                 s.antigravity_session_text.clone(),
                 s.antigravity_weekly_percent,
                 s.antigravity_weekly_text.clone(),
+                s.kimi_code_session_percent,
+                s.kimi_code_session_text.clone(),
+                s.kimi_code_weekly_percent,
+                s.kimi_code_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.show_kimi_code,
                 s.show_session_window,
                 s.show_weekly_window,
             ),
@@ -2295,6 +2502,7 @@ fn render_layered() {
     let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
     let codex_accent = provider_icons::codex_color(appearance.is_dark(is_dark));
     let antigravity_accent = antigravity_accent_color();
+    let kimi_code_accent = kimi_code_accent_color();
 
     unsafe {
         let screen_dc = GetDC(hwnd);
@@ -2353,13 +2561,19 @@ fn render_layered() {
             &antigravity_session_text,
             antigravity_weekly_pct,
             &antigravity_weekly_text,
+            kimi_code_session_pct,
+            &kimi_code_session_text,
+            kimi_code_weekly_pct,
+            &kimi_code_weekly_text,
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_kimi_code,
             show_session_window,
             show_weekly_window,
             &codex_accent,
             &antigravity_accent,
+            &kimi_code_accent,
         );
 
         // System mode blends with the taskbar. High contrast modes use a solid
@@ -2393,7 +2607,7 @@ fn render_layered() {
             AlphaFormat: 1, // AC_SRC_ALPHA
         };
 
-        let _ = UpdateLayeredWindow(
+        if let Err(error) = UpdateLayeredWindow(
             hwnd,
             screen_dc,
             None,
@@ -2403,7 +2617,9 @@ fn render_layered() {
             COLORREF(0),
             Some(&blend),
             ULW_ALPHA,
-        );
+        ) {
+            diagnose::log_error("unable to render the layered taskbar widget", error);
+        }
 
         // Cleanup
         SelectObject(mem_dc, old_bmp);
@@ -2438,13 +2654,19 @@ fn paint_content(
     antigravity_session_text: &str,
     antigravity_weekly_pct: f64,
     antigravity_weekly_text: &str,
+    kimi_code_session_pct: f64,
+    kimi_code_session_text: &str,
+    kimi_code_weekly_pct: f64,
+    kimi_code_weekly_text: &str,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_kimi_code: bool,
     show_session_window: bool,
     show_weekly_window: bool,
     codex_accent: &Color,
     antigravity_accent: &Color,
+    kimi_code_accent: &Color,
 ) {
     unsafe {
         let is_dark = appearance.is_dark(is_dark);
@@ -2454,6 +2676,8 @@ fn paint_content(
         let codex_weekly_pct = usage_percent_for_display(language, codex_weekly_pct);
         let antigravity_session_pct = usage_percent_for_display(language, antigravity_session_pct);
         let antigravity_weekly_pct = usage_percent_for_display(language, antigravity_weekly_pct);
+        let kimi_code_session_pct = usage_percent_for_display(language, kimi_code_session_pct);
+        let kimi_code_weekly_pct = usage_percent_for_display(language, kimi_code_weekly_pct);
         let (label_width, text_width) = usage_layout_widths(language, appearance);
 
         let client_rect = RECT {
@@ -2523,7 +2747,12 @@ fn paint_content(
         // One provider mark per column, centered across the visible quota rows.
         let icon_size = sc(provider_icons::SIZE);
         let icon_y = (height - icon_size) / 2;
-        let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+        let active_models = active_model_count(
+            show_claude_code,
+            show_codex,
+            show_antigravity,
+            show_kimi_code,
+        );
         let model_width = model_usage_width(row_bar_segment_count(active_models), text_width)
             + sc(MODEL_RIGHT_MARGIN);
         let mut icon_x = content_x + label_width + sc(LABEL_RIGHT_MARGIN);
@@ -2533,6 +2762,14 @@ fn paint_content(
         }
         if show_codex {
             provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::Codex);
+            icon_x += model_width;
+        }
+        if show_antigravity {
+            // Antigravity currently reserves its provider-mark space without artwork.
+            icon_x += model_width;
+        }
+        if show_kimi_code {
+            provider_icons::draw(hdc, icon_x, icon_y, icon_size, Provider::KimiCode);
         }
 
         if show_session_window {
@@ -2554,12 +2791,16 @@ fn paint_content(
                 codex_session_text,
                 antigravity_session_pct,
                 antigravity_session_text,
+                kimi_code_session_pct,
+                kimi_code_session_text,
                 show_claude_code,
                 show_codex,
                 show_antigravity,
+                show_kimi_code,
                 accent,
                 codex_accent,
                 antigravity_accent,
+                kimi_code_accent,
                 track,
                 label_width,
                 text_width,
@@ -2584,12 +2825,16 @@ fn paint_content(
                 codex_weekly_text,
                 antigravity_weekly_pct,
                 antigravity_weekly_text,
+                kimi_code_weekly_pct,
+                kimi_code_weekly_text,
                 show_claude_code,
                 show_codex,
                 show_antigravity,
+                show_kimi_code,
                 accent,
                 codex_accent,
                 antigravity_accent,
+                kimi_code_accent,
                 track,
                 label_width,
                 text_width,
@@ -2641,7 +2886,12 @@ fn request_poll(hwnd: SendHwnd, force: bool) {
     {
         let mut state = lock_state();
         if let Some(s) = state.as_mut() {
-            let enabled = [s.show_claude_code, s.show_codex, s.show_antigravity];
+            let enabled = [
+                s.show_claude_code,
+                s.show_codex,
+                s.show_antigravity,
+                s.show_kimi_code,
+            ];
             s.monitor.configure(enabled, Instant::now());
             if force {
                 s.monitor.force(Instant::now(), true);
@@ -2732,7 +2982,9 @@ fn complete_provider_poll(
             match job.id {
                 0 => fresh.claude_code = data,
                 1 => fresh.codex = data,
-                _ => fresh.antigravity = data,
+                2 => fresh.antigravity = data,
+                3 => fresh.kimi_code = data,
+                _ => {}
             }
         }
         let alerts = collect_low_quota_alerts(s, &fresh);
@@ -2752,6 +3004,11 @@ fn complete_provider_poll(
                 cached.antigravity.as_ref(),
                 &mut s.antigravity_session_percent,
                 &mut s.antigravity_weekly_percent,
+            ),
+            (
+                cached.kimi_code.as_ref(),
+                &mut s.kimi_code_session_percent,
+                &mut s.kimi_code_weekly_percent,
             ),
         ] {
             *session = usage.map_or(0.0, |u| u.session.percentage);
@@ -2781,11 +3038,17 @@ fn complete_provider_poll(
                     strings.codex_token_expired_title,
                     strings.codex_token_expired_body,
                 ),
-                _ => (
+                2 => (
                     tray_icon::TrayIconKind::Antigravity,
                     strings.antigravity_token_expired_title,
                     strings.antigravity_token_expired_body,
                 ),
+                3 => (
+                    tray_icon::TrayIconKind::KimiCode,
+                    strings.kimi_code_token_expired_title,
+                    strings.kimi_code_token_expired_body,
+                ),
+                _ => unreachable!("unknown provider id"),
             }
         });
         (alerts, notice)
@@ -2832,6 +3095,12 @@ fn schedule_countdown_timer() {
             .as_ref()
             .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
         data.antigravity
+            .as_ref()
+            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+        data.kimi_code
+            .as_ref()
+            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
+        data.kimi_code
             .as_ref()
             .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
     ];
@@ -3407,12 +3676,17 @@ unsafe extern "system" fn wnd_proc(
                             s.weekly_text = "...".to_string();
                             s.codex_session_text = "...".to_string();
                             s.codex_weekly_text = "...".to_string();
+                            s.antigravity_session_text = "...".to_string();
+                            s.antigravity_weekly_text = "...".to_string();
+                            s.kimi_code_session_text = "...".to_string();
+                            s.kimi_code_weekly_text = "...".to_string();
                         }
                     }
                     render_layered();
                     let sh = SendHwnd::from_hwnd(hwnd);
                     request_poll(sh, true);
                 }
+                IDM_KIMI_API_KEY => configure_kimi_api_key(hwnd),
                 IDM_VERSION_ACTION => {
                     let (install_channel, release) = {
                         let state = lock_state();
@@ -3637,7 +3911,10 @@ unsafe extern "system" fn wnd_proc(
                     }
                     save_state_settings();
                 }
-                IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_ANTIGRAVITY => {
+                IDM_MODEL_CLAUDE_CODE
+                | IDM_MODEL_CODEX
+                | IDM_MODEL_ANTIGRAVITY
+                | IDM_MODEL_KIMI_CODE => {
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
@@ -3646,20 +3923,38 @@ unsafe extern "system" fn wnd_proc(
                                     if s.claude_code_available
                                         && (s.show_codex
                                             || s.show_antigravity
+                                            || s.show_kimi_code
                                             || !s.show_claude_code)
                                     {
                                         s.show_claude_code = !s.show_claude_code;
                                     }
                                 }
                                 IDM_MODEL_CODEX => {
-                                    if s.show_claude_code || s.show_antigravity || !s.show_codex {
+                                    if s.show_claude_code
+                                        || s.show_antigravity
+                                        || s.show_kimi_code
+                                        || !s.show_codex
+                                    {
                                         s.show_codex = !s.show_codex;
                                     }
                                 }
                                 IDM_MODEL_ANTIGRAVITY => {
-                                    if s.show_claude_code || s.show_codex || !s.show_antigravity {
+                                    if s.show_claude_code
+                                        || s.show_codex
+                                        || s.show_kimi_code
+                                        || !s.show_antigravity
+                                    {
                                         s.show_antigravity = !s.show_antigravity;
                                     }
+                                }
+                                IDM_MODEL_KIMI_CODE
+                                    if (s.kimi_code_available || s.show_kimi_code)
+                                        && (s.show_claude_code
+                                            || s.show_codex
+                                            || s.show_antigravity
+                                            || !s.show_kimi_code) =>
+                                {
+                                    s.show_kimi_code = !s.show_kimi_code;
                                 }
                                 _ => {}
                             }
@@ -3669,6 +3964,8 @@ unsafe extern "system" fn wnd_proc(
                             s.codex_weekly_text = "...".to_string();
                             s.antigravity_session_text = "...".to_string();
                             s.antigravity_weekly_text = "...".to_string();
+                            s.kimi_code_session_text = "...".to_string();
+                            s.kimi_code_weekly_text = "...".to_string();
                         }
                     }
                     save_state_settings();
@@ -3775,7 +4072,67 @@ unsafe fn append_appearance_submenu(parent: HMENU, child: HMENU, label: &str) {
     );
 }
 
+fn configure_kimi_api_key(hwnd: HWND) {
+    let language = lock_state()
+        .as_ref()
+        .map_or(LanguageId::English, |s| s.language);
+    let outcome = match kimi_key_dialog::show(hwnd, language) {
+        Ok(kimi_key_dialog::Outcome::Cancelled) => return,
+        Ok(outcome) => outcome,
+        Err(error) => {
+            show_error_message(hwnd, "Kimi Code", &error);
+            return;
+        }
+    };
+    let available = poller::kimi_code_credentials_available();
+    {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else { return };
+        s.kimi_code_available = available;
+        if outcome == kimi_key_dialog::Outcome::Saved {
+            s.show_kimi_code = true;
+        } else if !available {
+            s.show_kimi_code = false;
+        }
+        if !s.show_claude_code && !s.show_codex && !s.show_antigravity && !s.show_kimi_code {
+            s.show_codex = true;
+        }
+        let now = Instant::now();
+        s.monitor.credentials_changed(3, now);
+        s.monitor.configure(
+            [
+                s.show_claude_code,
+                s.show_codex,
+                s.show_antigravity,
+                s.show_kimi_code,
+            ],
+            now,
+        );
+        s.data = Some(s.monitor.cached());
+        s.kimi_code_session_percent = 0.0;
+        s.kimi_code_weekly_percent = 0.0;
+        s.kimi_code_session_text = "...".into();
+        s.kimi_code_weekly_text = "...".into();
+        s.notified_quota_windows
+            .retain(|key| !key.starts_with("kimi_code:"));
+    }
+    save_state_settings();
+    position_at_taskbar();
+    render_layered();
+    sync_tray_icons(hwnd);
+    // Only Kimi was forced; changing its credentials must not refresh Claude.
+    start_poll(SendHwnd::from_hwnd(hwnd), true);
+}
+
 fn show_context_menu(hwnd: HWND) {
+    let current_kimi_code_available = poller::kimi_code_credentials_available();
+    {
+        let mut state = lock_state();
+        if let Some(s) = state.as_mut() {
+            s.kimi_code_available = current_kimi_code_available;
+        }
+    }
+
     unsafe {
         let (
             current_interval,
@@ -3787,8 +4144,10 @@ fn show_context_menu(hwnd: HWND) {
             widget_visible,
             show_claude_code,
             claude_code_available,
+            kimi_code_available,
             show_codex,
             show_antigravity,
+            show_kimi_code,
             show_session_window,
             show_weekly_window,
             alert_threshold_percent,
@@ -3806,8 +4165,10 @@ fn show_context_menu(hwnd: HWND) {
                     s.widget_visible,
                     s.show_claude_code,
                     s.claude_code_available,
+                    s.kimi_code_available,
                     s.show_codex,
                     s.show_antigravity,
+                    s.show_kimi_code,
                     s.show_session_window,
                     s.show_weekly_window,
                     s.alert_threshold_percent,
@@ -3822,6 +4183,8 @@ fn show_context_menu(hwnd: HWND) {
                     UpdateStatus::Idle,
                     true,
                     true,
+                    false,
+                    false,
                     false,
                     false,
                     false,
@@ -3936,12 +4299,36 @@ fn show_context_menu(hwnd: HWND) {
             PCWSTR::from_raw(antigravity_model.as_ptr()),
         );
 
+        let kimi_label = kimi_code_menu_label(strings, language, kimi_code_available);
+        let kimi_model = native_interop::wide_str(&kimi_label);
+        let kimi_flags = if show_kimi_code {
+            MF_CHECKED
+        } else if !kimi_code_available {
+            MF_GRAYED
+        } else {
+            MENU_ITEM_FLAGS(0)
+        };
+        let _ = AppendMenuW(
+            models_menu,
+            kimi_flags,
+            IDM_MODEL_KIMI_CODE as usize,
+            PCWSTR::from_raw(kimi_model.as_ptr()),
+        );
+
         let models_label = native_interop::wide_str(strings.models);
         let _ = AppendMenuW(
             menu,
             MF_POPUP,
             models_menu.0 as usize,
             PCWSTR::from_raw(models_label.as_ptr()),
+        );
+
+        let key_label = native_interop::wide_str(kimi_key_dialog::menu_label(language));
+        let _ = AppendMenuW(
+            menu,
+            MENU_ITEM_FLAGS(0),
+            IDM_KIMI_API_KEY as usize,
+            PCWSTR::from_raw(key_label.as_ptr()),
         );
 
         // Usage window visibility submenu. Keep at least one window enabled.
@@ -4404,9 +4791,14 @@ fn paint(hdc: HDC, hwnd: HWND) {
         antigravity_session_text,
         antigravity_weekly_pct,
         antigravity_weekly_text,
+        kimi_code_session_pct,
+        kimi_code_session_text,
+        kimi_code_weekly_pct,
+        kimi_code_weekly_text,
         show_claude_code,
         show_codex,
         show_antigravity,
+        show_kimi_code,
         show_session_window,
         show_weekly_window,
     ) = {
@@ -4429,9 +4821,14 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.antigravity_session_text.clone(),
                 s.antigravity_weekly_percent,
                 s.antigravity_weekly_text.clone(),
+                s.kimi_code_session_percent,
+                s.kimi_code_session_text.clone(),
+                s.kimi_code_weekly_percent,
+                s.kimi_code_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
                 s.show_antigravity,
+                s.show_kimi_code,
                 s.show_session_window,
                 s.show_weekly_window,
             ),
@@ -4443,6 +4840,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
     let (bg_color, text_color, track) = appearance_colors(appearance, is_dark);
     let codex_accent = provider_icons::codex_color(appearance.is_dark(is_dark));
     let antigravity_accent = antigravity_accent_color();
+    let kimi_code_accent = kimi_code_accent_color();
 
     unsafe {
         let mut client_rect = RECT::default();
@@ -4482,13 +4880,19 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &antigravity_session_text,
             antigravity_weekly_pct,
             &antigravity_weekly_text,
+            kimi_code_session_pct,
+            &kimi_code_session_text,
+            kimi_code_weekly_pct,
+            &kimi_code_weekly_text,
             show_claude_code,
             show_codex,
             show_antigravity,
+            show_kimi_code,
             show_session_window,
             show_weekly_window,
             &codex_accent,
             &antigravity_accent,
+            &kimi_code_accent,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -4513,17 +4917,26 @@ fn draw_row(
     codex_text: &str,
     antigravity_percent: f64,
     antigravity_text: &str,
+    kimi_code_percent: f64,
+    kimi_code_text: &str,
     show_claude_code: bool,
     show_codex: bool,
     show_antigravity: bool,
+    show_kimi_code: bool,
     claude_accent: &Color,
     codex_accent: &Color,
     antigravity_accent: &Color,
+    kimi_code_accent: &Color,
     track: &Color,
     label_width: i32,
     text_width: i32,
 ) {
-    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+    let active_models = active_model_count(
+        show_claude_code,
+        show_codex,
+        show_antigravity,
+        show_kimi_code,
+    );
     let segment_count = row_bar_segment_count(active_models);
     let use_model_text_colors = active_models > 1 && appearance.palette == Palette::System;
     let is_dark = appearance.is_dark(is_dark);
@@ -4535,6 +4948,11 @@ fn draw_row(
     let codex_value_color = provider_icons::codex_color(is_dark);
     let antigravity_value_color = if use_model_text_colors {
         antigravity_usage_text_color(is_dark)
+    } else {
+        *text_color
+    };
+    let kimi_code_value_color = if use_model_text_colors {
+        kimi_code_usage_text_color(is_dark)
     } else {
         *text_color
     };
@@ -4601,6 +5019,23 @@ fn draw_row(
                 antigravity_accent,
                 track,
                 &antigravity_value_color,
+                text_width,
+                is_dark,
+                appearance,
+            );
+            model_x += model_usage_width(segment_count, text_width) + sc(MODEL_RIGHT_MARGIN);
+        }
+        if show_kimi_code {
+            draw_usage_bar(
+                hdc,
+                model_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN),
+                y,
+                segment_count,
+                kimi_code_percent,
+                kimi_code_text,
+                kimi_code_accent,
+                track,
+                &kimi_code_value_color,
                 text_width,
                 is_dark,
                 appearance,
@@ -4742,6 +5177,106 @@ mod tests {
     }
 
     #[test]
+    fn kimi_column_renders_after_every_combination_of_other_services() {
+        unsafe {
+            let screen = GetDC(HWND::default());
+            assert!(!screen.is_invalid());
+            for mask in 0..8 {
+                let claude = mask & 1 != 0;
+                let codex = mask & 2 != 0;
+                let antigravity = mask & 4 != 0;
+                for palette in [Palette::HighContrastDark, Palette::HighContrastLight] {
+                    let appearance = Appearance {
+                        palette,
+                        ..Appearance::default()
+                    };
+                    let count = active_model_count(claude, codex, antigravity, true);
+                    let width = total_widget_width_for(count, LanguageId::English, appearance);
+                    let height = sc(WIDGET_HEIGHT);
+                    let dc = CreateCompatibleDC(screen);
+                    let bitmap = CreateCompatibleBitmap(screen, width, height);
+                    assert!(!dc.is_invalid() && !bitmap.is_invalid());
+                    let old = SelectObject(dc, bitmap);
+                    let (bg, text, track) = appearance_colors(appearance, false);
+                    let kimi_accent = kimi_code_accent_color();
+                    paint_content(
+                        dc,
+                        width,
+                        height,
+                        false,
+                        appearance,
+                        &bg,
+                        &text,
+                        &claude_accent_color(),
+                        &track,
+                        LanguageId::English,
+                        LanguageId::English.strings(),
+                        50.0,
+                        "50%",
+                        0.0,
+                        "--",
+                        50.0,
+                        "50%",
+                        0.0,
+                        "--",
+                        50.0,
+                        "50%",
+                        0.0,
+                        "--",
+                        50.0,
+                        "50%",
+                        0.0,
+                        "--",
+                        claude,
+                        codex,
+                        antigravity,
+                        true,
+                        true,
+                        true,
+                        &provider_icons::codex_color(appearance.is_dark(false)),
+                        &antigravity_accent_color(),
+                        &kimi_accent,
+                    );
+                    let (label_width, text_width) =
+                        usage_layout_widths(LanguageId::English, appearance);
+                    let column_width = model_usage_width(row_bar_segment_count(count), text_width)
+                        + sc(MODEL_RIGHT_MARGIN);
+                    let column_x = sc(LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN + LABEL_RIGHT_MARGIN)
+                        + label_width
+                        + (count - 1) * column_width;
+                    let bar_x = column_x + sc(provider_icons::SIZE + provider_icons::RIGHT_MARGIN);
+                    let first_row_y = (height - 2 * appearance.row_height() - sc(8)).max(0) / 2;
+                    let first_bar_y = first_row_y + appearance.row_height() / 2;
+                    assert_eq!(
+                        GetPixel(dc, bar_x + sc(2), first_bar_y).0,
+                        kimi_accent.to_colorref(),
+                        "mask={mask}"
+                    );
+                    let second_bar_y = first_bar_y + appearance.row_height() + sc(8);
+                    assert_eq!(
+                        GetPixel(dc, bar_x + sc(2), second_bar_y).0,
+                        track.to_colorref(),
+                        "mask={mask}"
+                    );
+                    let icon_y = (height - sc(provider_icons::SIZE)) / 2;
+                    assert!(
+                        (0..sc(provider_icons::SIZE)).any(|y| {
+                            (0..sc(provider_icons::SIZE)).any(|x| {
+                                GetPixel(dc, column_x + x, icon_y + y).0 != bg.to_colorref()
+                            })
+                        }),
+                        "Kimi icon missing for mask={mask}"
+                    );
+                    SelectObject(dc, old);
+                    let _ = DeleteObject(bitmap);
+                    let _ = DeleteDC(dc);
+                }
+            }
+            ReleaseDC(HWND::default(), screen);
+        }
+    }
+
+    #[test]
     fn localized_widget_text_fits_measured_columns_and_rows() {
         unsafe {
             let hdc = GetDC(HWND::default());
@@ -4810,6 +5345,35 @@ mod tests {
     }
 
     #[test]
+    fn tray_summary_keeps_all_four_providers_within_the_windows_limit() {
+        for language in LanguageId::ALL {
+            let strings = language.strings();
+            let services = [
+                (
+                    strings.claude_code_model,
+                    "100% · 99hours *",
+                    "100% · 99days *",
+                ),
+                (strings.codex_model, "100% · 99hours *", "100% · 99days *"),
+                (
+                    strings.antigravity_model,
+                    "100% · 99hours *",
+                    "100% · 99days *",
+                ),
+                (
+                    strings.kimi_code_model,
+                    "100% · 99hours *",
+                    "100% · 99days *",
+                ),
+            ];
+            let tooltip = tray_services_tooltip(&services, true, true);
+            assert!(tooltip.encode_utf16().count() <= 127, "{tooltip}");
+            assert_eq!(tooltip.lines().count(), 4);
+            assert!(tooltip.contains("Kimi Code: 5h 100%* | 7d 100%*"));
+        }
+    }
+
+    #[test]
     fn unavailable_claude_cli_has_an_explicit_menu_label() {
         assert_eq!(
             claude_code_menu_label(
@@ -4845,6 +5409,7 @@ mod tests {
         let old: SettingsFile = serde_json::from_str(&test_settings_json("zh-CN")).unwrap();
         assert_eq!(old.appearance, Appearance::default());
         assert_eq!(old.monitor_device, None);
+        assert!(!old.show_kimi_code);
 
         let customized = SettingsFile {
             appearance: Appearance::translucent_dark_taskbar(),
@@ -5031,6 +5596,57 @@ mod tests {
     }
 
     #[test]
+    fn kimi_settings_round_trip_and_normalize_without_reactivating_codex() {
+        let settings = SettingsFile {
+            show_claude_code: false,
+            show_codex: false,
+            show_antigravity: false,
+            show_kimi_code: true,
+            ..SettingsFile::default()
+        };
+        let restored: SettingsFile =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(restored.show_kimi_code);
+        let normalized = normalize_settings(restored);
+        assert!(normalized.show_kimi_code);
+        assert!(!normalized.show_codex);
+        assert_eq!(active_model_count(false, false, false, true), 1);
+        assert_eq!(active_model_count(true, true, true, true), 4);
+    }
+
+    #[test]
+    fn unavailable_kimi_cli_is_disabled_without_disabling_other_services() {
+        let settings = SettingsFile {
+            show_claude_code: true,
+            show_codex: false,
+            show_antigravity: false,
+            show_kimi_code: true,
+            ..SettingsFile::default()
+        };
+        let (settings, changed) = apply_kimi_code_availability(settings, false);
+        assert!(changed);
+        assert!(!settings.show_kimi_code);
+        assert!(settings.show_claude_code);
+        assert!(!settings.show_codex);
+    }
+
+    #[test]
+    fn unavailable_kimi_cli_has_an_explicit_menu_label() {
+        assert_eq!(
+            kimi_code_menu_label(
+                LanguageId::SimplifiedChinese.strings(),
+                LanguageId::SimplifiedChinese,
+                false,
+            ),
+            "Kimi Code（需 API Key 或登录 CLI）"
+        );
+        assert_eq!(
+            kimi_code_menu_label(LanguageId::English.strings(), LanguageId::English, true),
+            "Kimi Code"
+        );
+    }
+
+    #[test]
     fn formats_precise_local_reset_time() {
         let local = SYSTEMTIME {
             wYear: 2026,
@@ -5052,6 +5668,7 @@ mod tests {
         let first = crate::models::UsageSection {
             percentage: 85.0,
             resets_at: Some(first_reset),
+            reported: true,
         };
 
         append_quota_alert(
@@ -5084,6 +5701,7 @@ mod tests {
         let next = crate::models::UsageSection {
             percentage: 90.0,
             resets_at: Some(first_reset + Duration::from_secs(18_000)),
+            reported: true,
         };
         append_quota_alert(
             &mut alerts,
