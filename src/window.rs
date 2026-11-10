@@ -22,7 +22,7 @@ use crate::kimi_key_dialog;
 use crate::localization::{self, LanguageId, Strings};
 use crate::models::AppUsageData;
 use crate::native_interop::{
-    self, Color, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL, TIMER_TASKBAR_RETRY,
+    self, Color, TIMER_COUNTDOWN, TIMER_FRESHNESS, TIMER_POLL, TIMER_TASKBAR_CHECK,
     TIMER_UPDATE_CHECK, WM_APP_TRAY, WM_APP_USAGE_UPDATED,
 };
 use crate::poller;
@@ -1092,40 +1092,102 @@ fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
     true
 }
 
-fn preferred_taskbar_index(
+/// How often the widget checks that it sits on the taskbar of the chosen
+/// display (and, right after startup, that a taskbar exists at all).
+const TASKBAR_CHECK_INTERVAL_MS: u32 = 2_000;
+
+/// Decides which taskbar the widget belongs on, from the display device of each
+/// taskbar (`None` when it cannot be identified). Returns `None` when the
+/// widget should stay where it is.
+///
+/// The chosen display only counts when exactly one taskbar is on it. While it
+/// has no identifiable taskbar (Explorer recreating taskbars after a display
+/// change, monitor asleep, login still in progress) the widget keeps its
+/// current taskbar instead of jumping to the primary one; it only falls back
+/// to the primary taskbar when it has no taskbar at all.
+fn choose_taskbar_index(
+    devices: &[Option<String>],
+    monitor_device: Option<&str>,
+    legacy_index: usize,
+    current_index: Option<usize>,
+    primary_index: Option<usize>,
+) -> Option<usize> {
+    if devices.is_empty() {
+        return None;
+    }
+    let preferred = match monitor_device {
+        Some(device) => {
+            let mut matches = devices
+                .iter()
+                .enumerate()
+                .filter(|(_, candidate)| candidate.as_deref() == Some(device))
+                .map(|(index, _)| index);
+            match (matches.next(), matches.next()) {
+                (Some(index), None) => Some(index),
+                _ => None,
+            }
+        }
+        // Settings from before displays were remembered by device name.
+        None => current_index.or(Some(legacy_index.min(devices.len() - 1))),
+    };
+    let target = preferred.or(current_index).or(primary_index).unwrap_or(0);
+    (Some(target) != current_index).then_some(target)
+}
+
+fn taskbar_to_attach(
     taskbars: &[native_interop::TaskbarWindow],
     monitor_device: Option<&str>,
     legacy_index: usize,
-) -> usize {
-    match monitor_device {
-        Some(device) => taskbars
-            .iter()
-            .position(|taskbar| {
-                native_interop::taskbar_monitor_device(taskbar).as_deref() == Some(device)
-            })
-            .unwrap_or_else(|| {
-                taskbars
-                    .iter()
-                    .position(|taskbar| taskbar.is_primary)
-                    .unwrap_or(0)
-            }),
-        None => legacy_index.min(taskbars.len().saturating_sub(1)),
-    }
+    current: Option<HWND>,
+) -> Option<usize> {
+    let devices: Vec<Option<String>> = taskbars
+        .iter()
+        .map(native_interop::taskbar_monitor_device)
+        .collect();
+    let current_index = current.and_then(|hwnd| taskbars.iter().position(|t| t.hwnd == hwnd));
+    let primary_index = taskbars.iter().position(|t| t.is_primary);
+    choose_taskbar_index(
+        &devices,
+        monitor_device,
+        legacy_index,
+        current_index,
+        primary_index,
+    )
 }
 
+/// Moves the widget onto the taskbar of the chosen display when it is not
+/// already there. Runs periodically, not only on WM_DISPLAYCHANGE: when Explorer
+/// recreates a taskbar (full-screen mode switch, monitor waking up), the
+/// watchdog relaunches the widget, which may start before the chosen display's
+/// taskbar is back and therefore attach elsewhere temporarily.
 fn refresh_taskbar_selection(hwnd: HWND) {
-    let taskbars = native_interop::find_taskbars();
-    if taskbars.is_empty() {
-        return;
-    }
-    let (preferred, legacy_index, current) = {
+    let (preferred, legacy_index, current, was_embedded) = {
         let state = lock_state();
         let Some(s) = state.as_ref() else { return };
-        (s.monitor_device.clone(), s.taskbar_index, s.taskbar_hwnd)
+        if s.dragging {
+            return;
+        }
+        (
+            s.monitor_device.clone(),
+            s.taskbar_index,
+            s.taskbar_hwnd,
+            s.embedded,
+        )
     };
-    let index = preferred_taskbar_index(&taskbars, preferred.as_deref(), legacy_index);
-    if current != Some(taskbars[index].hwnd) {
-        attach_to_taskbar(hwnd, index);
+    let taskbars = native_interop::find_taskbars();
+    let Some(index) = taskbar_to_attach(&taskbars, preferred.as_deref(), legacy_index, current)
+    else {
+        return;
+    };
+    diagnose::log(format!(
+        "moving widget to taskbar index={index} (chosen display {preferred:?})"
+    ));
+    if attach_to_taskbar(hwnd, index) {
+        position_at_taskbar();
+        render_layered();
+        if !was_embedded {
+            diagnose::log("taskbar attached after startup retry");
+        }
     }
 }
 
@@ -2275,17 +2337,19 @@ pub fn run() {
 
         // Try to embed in taskbar
         let taskbars = native_interop::find_taskbars();
-        let selected_index = preferred_taskbar_index(
+        let selected_index = taskbar_to_attach(
             &taskbars,
             settings.monitor_device.as_deref(),
             settings.taskbar_index,
+            None,
         );
-        if attach_to_taskbar(hwnd, selected_index) {
+        if selected_index.is_some_and(|index| attach_to_taskbar(hwnd, index)) {
             embedded = true;
-        } else {
-            // During login Explorer may create its taskbar after this app starts.
-            SetTimer(hwnd, TIMER_TASKBAR_RETRY, 2_000, None);
         }
+        // During login Explorer may create its taskbar after this app starts,
+        // and after a relaunch the chosen display's taskbar may not be back
+        // yet: keep checking so the widget attaches, then returns to it.
+        SetTimer(hwnd, TIMER_TASKBAR_CHECK, TASKBAR_CHECK_INTERVAL_MS, None);
 
         // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
         if !embedded {
@@ -3487,24 +3551,8 @@ unsafe extern "system" fn wnd_proc(
                     render_layered();
                     schedule_countdown_timer();
                 }
-                TIMER_TASKBAR_RETRY => {
-                    let attachment = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| (s.embedded, s.taskbar_index))
-                    };
-                    match attachment {
-                        Some((true, _)) | None => {
-                            let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
-                        }
-                        Some((false, index)) => {
-                            if attach_to_taskbar(hwnd, index) {
-                                let _ = KillTimer(hwnd, TIMER_TASKBAR_RETRY);
-                                position_at_taskbar();
-                                render_layered();
-                                diagnose::log("taskbar attached after startup retry");
-                            }
-                        }
-                    }
+                TIMER_TASKBAR_CHECK => {
+                    refresh_taskbar_selection(hwnd);
                 }
                 TIMER_FRESHNESS => {
                     update_display();
@@ -5601,6 +5649,80 @@ mod tests {
         }
         assert_eq!(compute_anchor_x(0, 300, 606, 321, true), 0);
         assert_eq!(compute_anchor_x(0, 2000, 606, 321, false), 1073);
+    }
+
+    fn displays(names: &[Option<&str>]) -> Vec<Option<String>> {
+        names.iter().map(|name| name.map(str::to_string)).collect()
+    }
+
+    // Taskbars are sorted by position: a secondary display above the primary
+    // taskbar comes first, so index 1 is the primary taskbar here.
+    const SECONDARY: &str = r"\\.\DISPLAY2";
+    const PRIMARY: &str = r"\\.\DISPLAY1";
+
+    #[test]
+    fn widget_moves_back_to_the_chosen_display_once_its_taskbar_is_identified() {
+        let both = displays(&[Some(SECONDARY), Some(PRIMARY)]);
+        // Relaunched onto the primary taskbar while the secondary one was missing.
+        assert_eq!(
+            choose_taskbar_index(&both, Some(SECONDARY), 0, Some(1), Some(1)),
+            Some(0)
+        );
+        // Already on the chosen display: nothing to do.
+        assert_eq!(
+            choose_taskbar_index(&both, Some(SECONDARY), 0, Some(0), Some(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn widget_stays_put_while_the_chosen_display_has_no_identified_taskbar() {
+        // Explorer still reports stale geometry for the secondary taskbar.
+        let stale = displays(&[None, Some(PRIMARY)]);
+        assert_eq!(
+            choose_taskbar_index(&stale, Some(SECONDARY), 0, Some(0), Some(1)),
+            None
+        );
+        // Secondary taskbar destroyed and not recreated yet.
+        let primary_only = displays(&[Some(PRIMARY)]);
+        assert_eq!(
+            choose_taskbar_index(&primary_only, Some(SECONDARY), 0, Some(0), Some(0)),
+            None
+        );
+    }
+
+    #[test]
+    fn two_taskbars_claiming_the_chosen_display_do_not_move_the_widget() {
+        let ambiguous = displays(&[Some(PRIMARY), Some(PRIMARY)]);
+        assert_eq!(
+            choose_taskbar_index(&ambiguous, Some(PRIMARY), 1, Some(1), Some(1)),
+            None
+        );
+    }
+
+    #[test]
+    fn widget_without_taskbar_falls_back_to_the_primary_taskbar() {
+        let primary_only = displays(&[None, Some(PRIMARY)]);
+        assert_eq!(
+            choose_taskbar_index(&primary_only, Some(SECONDARY), 0, None, Some(1)),
+            Some(1)
+        );
+        let both = displays(&[Some(SECONDARY), Some(PRIMARY)]);
+        assert_eq!(
+            choose_taskbar_index(&both, Some(SECONDARY), 1, None, Some(1)),
+            Some(0)
+        );
+        assert_eq!(
+            choose_taskbar_index(&[], Some(SECONDARY), 0, None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_display_index_only_applies_before_the_widget_is_attached() {
+        let both = displays(&[Some(SECONDARY), Some(PRIMARY)]);
+        assert_eq!(choose_taskbar_index(&both, None, 5, None, Some(1)), Some(1));
+        assert_eq!(choose_taskbar_index(&both, None, 0, Some(1), Some(1)), None);
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{BOOL, FILETIME, HWND, LPARAM, RECT, SYSTEMTIME};
 use windows::Win32::Graphics::Gdi::{
-    GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    GetMonitorInfoW, MonitorFromRect, MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONULL,
 };
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
@@ -24,7 +24,7 @@ pub const TIMER_POLL: usize = 1;
 pub const TIMER_COUNTDOWN: usize = 2;
 pub const TIMER_UPDATE_CHECK: usize = 4;
 pub const TIMER_FRESHNESS: usize = 5;
-pub const TIMER_TASKBAR_RETRY: usize = 6;
+pub const TIMER_TASKBAR_CHECK: usize = 6;
 
 // Custom messages
 pub const WM_APP: u32 = 0x8000;
@@ -60,13 +60,15 @@ pub struct TaskbarWindow {
 
 /// Windows display device name (for example \\.\DISPLAY2) for a taskbar.
 /// Unlike enumeration order, this survives taskbar recreation and rearrangement.
+///
+/// Returns `None` when the taskbar rectangle lies on no current monitor. During
+/// a display change (full-screen mode switch, monitor waking up or going to
+/// sleep) Explorer still reports the old taskbar geometry for a while; mapping
+/// it to the *nearest* monitor would attribute a stale taskbar to the wrong
+/// display, and two taskbars could then claim the same one.
 pub fn taskbar_monitor_device(taskbar: &TaskbarWindow) -> Option<String> {
-    let point = windows::Win32::Foundation::POINT {
-        x: taskbar.rect.left + (taskbar.rect.right - taskbar.rect.left) / 2,
-        y: taskbar.rect.top + (taskbar.rect.bottom - taskbar.rect.top) / 2,
-    };
     unsafe {
-        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
+        let monitor = MonitorFromRect(&taskbar.rect, MONITOR_DEFAULTTONULL);
         if monitor.is_invalid() {
             return None;
         }
@@ -363,6 +365,23 @@ mod attachment_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn stale_taskbar_off_every_monitor_has_no_display() {
+        // Geometry left over from a monitor that just disappeared must not be
+        // attributed to whichever display happens to be nearest.
+        let stale = TaskbarWindow {
+            hwnd: HWND::default(),
+            rect: RECT {
+                left: -1_000_000,
+                top: -1_000_000,
+                right: -998_080,
+                bottom: -999_952,
+            },
+            is_primary: false,
+        };
+        assert_eq!(taskbar_monitor_device(&stale), None);
     }
 }
 
