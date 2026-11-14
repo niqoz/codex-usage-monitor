@@ -12,6 +12,7 @@ mod provider_poll;
 mod quota_refresh;
 mod quota_text;
 mod quota_tooltip;
+mod reauth;
 mod recovery_events;
 mod retry_after;
 mod settings_store;

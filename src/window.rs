@@ -31,6 +31,7 @@ use crate::provider_poll;
 use crate::quota_refresh;
 use crate::quota_text;
 use crate::quota_tooltip;
+use crate::reauth;
 use crate::recovery_events;
 use crate::settings_store;
 use crate::theme;
@@ -156,6 +157,9 @@ const IDM_MODEL_CODEX: u16 = 61;
 const IDM_MODEL_ANTIGRAVITY: u16 = 62;
 const IDM_MODEL_KIMI_CODE: u16 = 63;
 const IDM_KIMI_API_KEY: u16 = 64;
+const IDM_REAUTH_CLAUDE_CODE: u16 = 65;
+const IDM_REAUTH_CODEX: u16 = 66;
+const IDM_REAUTH_KIMI_CODE: u16 = 67;
 const IDM_SHOW_SESSION_WINDOW: u16 = 71;
 const IDM_SHOW_WEEKLY_WINDOW: u16 = 72;
 const IDM_ALERT_OFF: u16 = 80;
@@ -178,6 +182,8 @@ const MAX_MONITOR_MENU_ITEMS: usize = 100;
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
+/// Posted when a sign-in console closes; WPARAM carries the provider id.
+const WM_APP_REAUTH_DONE: u32 = WM_APP + 4;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
 
 /// How often the watchdog thread polls for an explorer.exe restart (which
@@ -3576,6 +3582,12 @@ unsafe extern "system" fn wnd_proc(
             sync_tray_icons(hwnd);
             LRESULT(0)
         }
+        WM_APP_REAUTH_DONE => {
+            if let Some(service) = reauth::Service::from_provider_id(wparam.0) {
+                finish_reauth(hwnd, service);
+            }
+            LRESULT(0)
+        }
         WM_APP_UPDATE_CHECK_COMPLETE => {
             schedule_auto_update_check(hwnd);
             LRESULT(0)
@@ -3789,6 +3801,9 @@ unsafe extern "system" fn wnd_proc(
                     request_poll(sh, true);
                 }
                 IDM_KIMI_API_KEY => configure_kimi_api_key(hwnd),
+                IDM_REAUTH_CLAUDE_CODE => start_reauth(hwnd, reauth::Service::ClaudeCode),
+                IDM_REAUTH_CODEX => start_reauth(hwnd, reauth::Service::Codex),
+                IDM_REAUTH_KIMI_CODE => start_reauth(hwnd, reauth::Service::KimiCode),
                 IDM_VERSION_ACTION => {
                     let (install_channel, release) = {
                         let state = lock_state();
@@ -4226,14 +4241,121 @@ fn configure_kimi_api_key(hwnd: HWND) {
     start_poll(SendHwnd::from_hwnd(hwnd), true);
 }
 
-fn show_context_menu(hwnd: HWND) {
-    let current_kimi_code_available = poller::kimi_code_credentials_available();
+fn start_reauth(hwnd: HWND, service: reauth::Service) {
+    let language = lock_state()
+        .as_ref()
+        .map_or(LanguageId::English, |s| s.language);
+    let send_hwnd = SendHwnd::from_hwnd(hwnd);
+    let provider_id = service.provider_id();
+    let result = reauth::launch_login(service, move || unsafe {
+        let _ = PostMessageW(
+            send_hwnd.to_hwnd(),
+            WM_APP_REAUTH_DONE,
+            WPARAM(provider_id),
+            LPARAM(0),
+        );
+    });
+    let Err(error) = result else { return };
+    let text = reauth::labels(language);
+    if service == reauth::Service::KimiCode && error == reauth::LaunchError::CliNotFound {
+        // Kimi Code also accepts an API key stored by this app.
+        let accepted = unsafe {
+            let title = native_interop::wide_str(text.error_title);
+            let message = native_interop::wide_str(text.kimi_cli_not_found);
+            MessageBoxW(
+                hwnd,
+                PCWSTR::from_raw(message.as_ptr()),
+                PCWSTR::from_raw(title.as_ptr()),
+                MB_YESNO | MB_ICONQUESTION,
+            ) == IDYES
+        };
+        if accepted {
+            configure_kimi_api_key(hwnd);
+        }
+        return;
+    }
+    show_error_message(
+        hwnd,
+        text.error_title,
+        &reauth::error_message(language, service, &error),
+    );
+}
+
+/// Reads the credentials written by the sign-in console and refreshes only
+/// that service, showing it again if the sign-in made it available.
+fn finish_reauth(hwnd: HWND, service: reauth::Service) {
+    let id = service.provider_id();
+    let available = match service {
+        reauth::Service::ClaudeCode => poller::claude_code_credentials_available(),
+        reauth::Service::Codex => true,
+        reauth::Service::KimiCode => poller::kimi_code_credentials_available(),
+    };
     {
         let mut state = lock_state();
-        if let Some(s) = state.as_mut() {
-            s.kimi_code_available = current_kimi_code_available;
+        let Some(s) = state.as_mut() else { return };
+        match service {
+            reauth::Service::ClaudeCode => {
+                s.claude_code_available = available;
+                if available {
+                    s.show_claude_code = true;
+                }
+            }
+            reauth::Service::Codex => s.show_codex = true,
+            reauth::Service::KimiCode => {
+                s.kimi_code_available = available;
+                if available {
+                    s.show_kimi_code = true;
+                }
+            }
         }
+        let now = Instant::now();
+        s.monitor.credentials_changed(id, now);
+        s.monitor.configure(
+            [
+                s.show_claude_code,
+                s.show_codex,
+                s.show_antigravity,
+                s.show_kimi_code,
+            ],
+            now,
+        );
+        s.data = Some(s.monitor.cached());
     }
+    save_state_settings();
+    position_at_taskbar();
+    render_layered();
+    sync_tray_icons(hwnd);
+    start_poll(SendHwnd::from_hwnd(hwnd), true);
+}
+
+fn show_context_menu(hwnd: HWND) {
+    let current_kimi_code_available = poller::kimi_code_credentials_available();
+    let needs_sign_in = {
+        let mut state = lock_state();
+        match state.as_mut() {
+            Some(s) => {
+                s.kimi_code_available = current_kimi_code_available;
+                let enabled = [
+                    s.show_claude_code,
+                    s.show_codex,
+                    s.show_antigravity,
+                    s.show_kimi_code,
+                ];
+                std::array::from_fn::<bool, 4, _>(|id| {
+                    enabled[id]
+                        && matches!(
+                            s.monitor.services[id].error,
+                            Some(
+                                poller::PollError::AuthRequired
+                                    | poller::PollError::TokenExpired
+                                    | poller::PollError::NoCredentials
+                            )
+                        )
+                })
+            }
+            None => [false; 4],
+        }
+    };
 
     unsafe {
         let (
@@ -4432,6 +4554,27 @@ fn show_context_menu(hwnd: HWND) {
             IDM_KIMI_API_KEY as usize,
             PCWSTR::from_raw(key_label.as_ptr()),
         );
+
+        // Sign-in submenu: reruns each service's official CLI login.
+        let reauth_text = reauth::labels(language);
+        let reauth_menu = CreatePopupMenu().unwrap();
+        for (service, id) in [
+            (reauth::Service::ClaudeCode, IDM_REAUTH_CLAUDE_CODE),
+            (reauth::Service::Codex, IDM_REAUTH_CODEX),
+            (reauth::Service::KimiCode, IDM_REAUTH_KIMI_CODE),
+        ] {
+            let label = if needs_sign_in[service.provider_id()] {
+                format!(
+                    "{}… ({})",
+                    service.display_name(),
+                    reauth_text.needs_sign_in
+                )
+            } else {
+                format!("{}…", service.display_name())
+            };
+            append_appearance_choice(reauth_menu, id, false, &label);
+        }
+        append_appearance_submenu(menu, reauth_menu, reauth_text.menu);
 
         // Usage window visibility submenu. Keep at least one window enabled.
         let usage_menu = CreatePopupMenu().unwrap();
